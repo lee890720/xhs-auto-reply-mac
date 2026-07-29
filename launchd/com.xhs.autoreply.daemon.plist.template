@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.xhs.autoreply.daemon</string>
+
+    <!-- 用 LaunchAgent 而不是 LaunchDaemon：Playwright 需要在用户的图形会话中
+         打开可见的浏览器窗口，系统级 daemon 没有 GUI 会话。 -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>-m</string>
+        <string>xhsd</string>
+        <string>--port</string>
+        <string>8787</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT__</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- 崩溃后自动拉起，这是无人值守长期运行的关键 -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- 崩溃重启的最小间隔，避免启动失败时疯狂重试 -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>__LOGDIR__/daemon.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOGDIR__/daemon.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <key>PYTHONPATH</key>
+        <string>__PROJECT__</string>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

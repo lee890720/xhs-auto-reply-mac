@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>小红书自动回复 · 控制台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">书</span>
+    <div>
+      <div class="brand-title">小红书自动回复</div>
+      <div class="brand-sub">本地控制台</div>
+    </div>
+  </div>
+
+  <div class="topbar-right">
+    <div class="status-chip" id="status-chip">
+      <span class="dot" id="status-dot"></span>
+      <span id="status-text">连接中…</span>
+    </div>
+    <button class="btn btn-primary" id="btn-toggle" onclick="toggleEngine()">启动</button>
+  </div>
+</header>
+
+<!-- 登录失效横幅 -->
+<div class="banner banner-warn" id="login-banner" hidden>
+  <div>
+    <strong>小红书登录态失效</strong>
+    <span>需要在浏览器窗口中扫码登录，期间不会执行任何页面操作。</span>
+  </div>
+  <div class="banner-actions">
+    <button class="btn btn-sm" onclick="openLogin()">打开浏览器</button>
+    <button class="btn btn-sm btn-primary" onclick="recheckLogin()">重新检测</button>
+  </div>
+</div>
+
+<!-- 未配置模型横幅 -->
+<div class="banner banner-info" id="setup-banner" hidden>
+  <div>
+    <strong>还没有配置模型 API</strong>
+    <span>前往「设置」填写服务商和 API Key，否则无法生成回复。</span>
+  </div>
+  <div class="banner-actions">
+    <button class="btn btn-sm btn-primary" onclick="switchTab('settings')">去设置</button>
+  </div>
+</div>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="overview" onclick="switchTab('overview')">概览</button>
+  <button class="tab" data-tab="review" onclick="switchTab('review')">
+    审核队列 <span class="badge" id="badge-pending" hidden>0</span>
+  </button>
+  <button class="tab" data-tab="settings" onclick="switchTab('settings')">设置</button>
+  <button class="tab" data-tab="logs" onclick="switchTab('logs')">日志</button>
+</nav>
+
+<main>
+
+<!-- ============ 概览 ============ -->
+<section class="panel active" id="panel-overview">
+  <div class="cards">
+    <div class="card">
+      <div class="card-value" id="stat-today">–</div>
+      <div class="card-label">今日已发送</div>
+      <div class="card-hint" id="stat-quota"></div>
+    </div>
+    <div class="card">
+      <div class="card-value" id="stat-pending">–</div>
+      <div class="card-label">待审核</div>
+      <div class="card-hint">审核模式下需人工放行</div>
+    </div>
+    <div class="card">
+      <div class="card-value accent-green" id="stat-rate">–</div>
+      <div class="card-label">发送成功率</div>
+      <div class="card-hint" id="stat-failed"></div>
+    </div>
+    <div class="card">
+      <div class="card-value" id="stat-total">–</div>
+      <div class="card-label">累计已回复</div>
+      <div class="card-hint" id="stat-messages"></div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-head"><h2>最近 14 天发送量</h2></div>
+    <div class="chart" id="chart"></div>
+  </div>
+
+  <div class="section">
+    <div class="section-head"><h2>互动最多的用户</h2></div>
+    <div class="author-list" id="author-list"></div>
+  </div>
+</section>
+
+<!-- ============ 审核队列 ============ -->
+<section class="panel" id="panel-review">
+  <div class="filter-bar">
+    <div class="filters" id="filters"></div>
+    <button class="btn btn-sm btn-primary" id="btn-approve-all" onclick="approveAll()">全部批准</button>
+  </div>
+  <div class="queue" id="queue"></div>
+</section>
+
+<!-- ============ 设置 ============ -->
+<section class="panel" id="panel-settings">
+
+  <div class="section">
+    <div class="section-head">
+      <h2>模型 API</h2>
+      <p>回复由这里配置的大模型生成。所有服务商都使用 OpenAI 兼容接口。</p>
+    </div>
+    <div class="form">
+      <label class="field">
+        <span class="field-label">服务商</span>
+        <select id="llm-provider" onchange="onProviderChange()"></select>
+        <span class="field-hint" id="provider-note"></span>
+      </label>
+
+      <label class="field">
+        <span class="field-label">API Key</span>
+        <input type="password" id="llm-api_key" placeholder="粘贴服务商控制台生成的 Key" autocomplete="off">
+        <span class="field-hint" id="key-hint">Key 只保存在本机数据库，不会上传任何地方。</span>
+      </label>
+
+      <label class="field">
+        <span class="field-label">Base URL</span>
+        <input type="text" id="llm-base_url" placeholder="留空则使用服务商默认端点">
+      </label>
+
+      <label class="field">
+        <span class="field-label">模型</span>
+        <input type="text" id="llm-model" list="model-options" placeholder="留空则使用推荐模型">
+        <datalist id="model-options"></datalist>
+      </label>
+
+      <div class="field-row">
+        <label class="field">
+          <span class="field-label">temperature</span>
+          <input type="number" id="llm-temperature" step="0.1" min="0" max="2">
+          <span class="field-hint">越高越活泼，评论回复建议 0.8–1.0</span>
+        </label>
+        <label class="field">
+          <span class="field-label">max_tokens</span>
+          <input type="number" id="llm-max_tokens" min="50" max="2000">
+        </label>
+        <label class="field">
+          <span class="field-label">超时（秒）</span>
+          <input type="number" id="llm-timeout" min="10" max="300">
+        </label>
+      </div>
+
+      <div class="form-actions">
+        <button class="btn btn-primary" onclick="saveSection('llm')">保存</button>
+        <button class="btn" onclick="testLLM()">测试连接</button>
+        <span class="form-msg" id="msg-llm"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-head">
+      <h2>回复人设</h2>
+      <p>这段提示词决定回复的语气和边界，改完立即生效，不需要重启。</p>
+    </div>
+    <div class="form">
+      <label class="field">
+        <span class="field-label">System Prompt</span>
+        <textarea id="persona-system_prompt" rows="16"></textarea>
+      </label>
+      <div class="form-actions">
+        <button class="btn btn-primary" onclick="saveSection('persona')">保存</button>
+        <span class="form-msg" id="msg-persona"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-head">
+      <h2>回复策略</h2>
+      <p>控制发送节奏与频率，直接关系到账号安全。</p>
+    </div>
+    <div class="form">
+      <label class="field">
+        <span class="field-label">运行模式</span>
+        <select id="reply-mode">
+          <option value="review">审核模式 — 生成草稿，人工放行后才发送</option>
+          <option value="auto">全自动 — 生成后直接发送</option>
+        </select>
+        <span class="field-hint">建议先用审核模式跑一周，确认回复质量后再切全自动。</span>
+      </label>
+
+      <div class="field-row">
+        <label class="field">
+          <span class="field-label">轮询间隔（秒）</span>
+          <input type="number" id="reply-poll_interval" min="30">
+        </label>
+        <label class="field">
+          <span class="field-label">每日发送上限</span>
+          <input type="number" id="reply-daily_limit" min="1">
+        </label>
+        <label class="field">
+          <span class="field-label">单轮采集上限</span>
+          <input type="number" id="reply-max_per_poll" min="1">
+        </label>
+      </div>
+
+      <div class="field-row">
+        <label class="field">
+          <span class="field-label">发送间隔下限（秒）</span>
+          <input type="number" id="reply-min_delay" step="1" min="1">
+        </label>
+        <label class="field">
+          <span class="field-label">发送间隔上限（秒）</span>
+          <input type="number" id="reply-max_delay" step="1" min="1">
+        </label>
+      </div>
+
+      <label class="check">
+        <input type="checkbox" id="reply-quiet_enabled">
+        <span>启用夜间静默（该时段不采集、不发送）</span>
+      </label>
+      <div class="field-row">
+        <label class="field">
+          <span class="field-label">静默开始</span>
+          <input type="text" id="reply-quiet_start" placeholder="23:00">
+        </label>
+        <label class="field">
+          <span class="field-label">静默结束</span>
+          <input type="text" id="reply-quiet_end" placeholder="08:00">
+        </label>
+      </div>
+
+      <div class="form-actions">
+        <button class="btn btn-primary" onclick="saveSection('reply')">保存</button>
+        <span class="form-msg" id="msg-reply"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-head">
+      <h2>安全策略</h2>
+      <p>命中敏感词的评论不会走模型，避免在敏感话题上自动发言。</p>
+    </div>
+    <div class="form">
+      <label class="field">
+        <span class="field-label">敏感词（一行一个）</span>
+        <textarea id="safety-sensitive_keywords" rows="8"></textarea>
+      </label>
+      <label class="field">
+        <span class="field-label">命中后的处理</span>
+        <select id="safety-on_sensitive">
+          <option value="block">转人工 — 标记后不生成回复，等你手动处理</option>
+          <option value="fallback">兜底话术 — 用下面这句先稳住对方</option>
+        </select>
+      </label>
+      <label class="field">
+        <span class="field-label">兜底话术</span>
+        <input type="text" id="safety-fallback_text">
+      </label>
+      <div class="form-actions">
+        <button class="btn btn-primary" onclick="saveSection('safety')">保存</button>
+        <span class="form-msg" id="msg-safety"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-head"><h2>系统</h2></div>
+    <div class="form">
+      <label class="check">
+        <input type="checkbox" id="autostart" onchange="saveAutostart()">
+        <span>守护进程启动时自动开始监控</span>
+      </label>
+      <div class="form-actions">
+        <button class="btn btn-danger-ghost" onclick="cleanup()">清理 90 天前的历史数据</button>
+        <span class="form-msg" id="msg-system"></span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 日志 ============ -->
+<section class="panel" id="panel-logs">
+  <div class="section">
+    <div class="section-head">
+      <h2>运行日志</h2>
+      <button class="btn btn-sm" onclick="loadLogs()">刷新</button>
+    </div>
+    <div class="logs" id="logs"></div>
+  </div>
+</section>
+
+</main>
+
+<div class="toast" id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

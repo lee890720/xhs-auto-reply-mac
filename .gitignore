@@ -9,3 +9,5 @@ build/
 venv/
 *.bak
 .DS_Store
+*.icns
+icon.iconset/
