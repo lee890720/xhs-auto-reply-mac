@@ -20,6 +20,7 @@ import hashlib
 import random
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 
 from loguru import logger
 from playwright.async_api import async_playwright, BrowserContext, Page
@@ -77,6 +78,16 @@ class BrowserSession:
             return
         ensure_dirs()
         self._pw = await async_playwright().start()
+
+        # 先自己检查，否则 Playwright 抛出的是一大段 ASCII 边框提示，
+        # 混在控制台错误里既难读也说不清该在哪个环境执行修复命令。
+        exe = Path(self._pw.chromium.executable_path)
+        if not exe.exists():
+            raise BrowserUnavailable(
+                "Chromium 浏览器内核未安装。请在项目目录下执行："
+                "  .venv/bin/python -m playwright install chromium"
+            )
+
         self.context = await self._pw.chromium.launch_persistent_context(
             user_data_dir=str(BROWSER_DIR),
             headless=self.headless,

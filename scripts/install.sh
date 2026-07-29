@@ -41,11 +41,32 @@ info "安装依赖"
 ok "依赖就绪"
 
 # ---------- 2. 浏览器内核 ----------
-if [ ! -d "$HOME/Library/Caches/ms-playwright" ]; then
+# 不能用「缓存目录是否存在」判断：目录可能是旧版 Playwright 留下的，
+# 而新版要求的 chromium 版本号不同，会在运行时才报 Executable doesn't exist。
+# 直接问 Playwright 要可执行文件路径并检查。
+if ! "$PYTHON" - <<'PYEOF' 2>/dev/null
+import os, sys
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    sys.exit(0 if os.path.exists(p.chromium.executable_path) else 1)
+PYEOF
+then
     info "下载 Chromium（约 150MB，仅首次）"
     "$PYTHON" -m playwright install chromium
 fi
-ok "浏览器内核就绪"
+
+if "$PYTHON" - <<'PYEOF' 2>/dev/null
+import os, sys
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    sys.exit(0 if os.path.exists(p.chromium.executable_path) else 1)
+PYEOF
+then
+    ok "浏览器内核就绪"
+else
+    echo "Chromium 安装失败，请手动执行: $PYTHON -m playwright install chromium" >&2
+    exit 1
+fi
 
 mkdir -p "$DATA_DIR" "$LOG_DIR" "$AGENT_DIR" "$HOME/Applications"
 chmod 700 "$DATA_DIR"          # 数据库里有 API Key，收紧权限
