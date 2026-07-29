@@ -269,16 +269,6 @@ def set_setting(key: str, value: Any) -> None:
     )
 
 
-def all_settings() -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for row in query("SELECT key, value FROM settings"):
-        try:
-            out[row["key"]] = json.loads(row["value"])
-        except json.JSONDecodeError:
-            continue
-    return out
-
-
 # ==================== 事件 ====================
 
 def log_event(level: str, source: str, message: str) -> None:
