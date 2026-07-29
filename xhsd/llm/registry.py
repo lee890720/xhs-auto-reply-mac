@@ -4,17 +4,22 @@
 这些服务商都提供 OpenAI 兼容的 /chat/completions 接口，
 所以一套客户端就能覆盖，切换只是换 base_url + key + model。
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
 class Provider:
+    """
+    只预设 base_url —— 端点是固定的、可验证的，填错立刻报错。
+
+    刻意不预设模型名：各家模型列表更新频繁，且能用哪些取决于账号开通情况。
+    硬编码一份清单迟早过时，反而会诱导用户填一个并不存在的模型。
+    模型名一律由用户从服务商控制台查到后自行填写。
+    """
     key: str
     label: str
     base_url: str                       # 空字符串表示必须由用户填写
-    models: list[str] = field(default_factory=list)
-    default_model: str = ""
-    console_url: str = ""               # 控制台链接，方便用户去申请 Key
+    console_url: str = ""               # 控制台链接，用于申请 Key 和查可用模型
     note: str = ""
 
 
@@ -23,35 +28,26 @@ PROVIDERS: dict[str, Provider] = {
         key="deepseek",
         label="DeepSeek",
         base_url="https://api.deepseek.com/v1",
-        models=["deepseek-chat", "deepseek-reasoner"],
-        default_model="deepseek-chat",
-        console_url="https://platform.deepseek.com/api_keys",
-        note="性价比高，中文口语化表达自然，适合评论区短回复。推荐 deepseek-chat。",
+        console_url="https://platform.deepseek.com",
+        note="性价比高，中文口语化表达自然，适合评论区短回复。模型名见控制台的接口文档。",
     ),
     "dashscope": Provider(
         key="dashscope",
         label="阿里百炼（通义千问）",
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        models=["qwen-plus", "qwen-turbo", "qwen-max"],
-        default_model="qwen-plus",
         console_url="https://bailian.console.aliyun.com/",
-        note="国内延迟低，qwen-turbo 便宜、qwen-plus 质量更好。使用 OpenAI 兼容模式端点。",
+        note="国内延迟低。使用 OpenAI 兼容模式端点，模型名见控制台的模型广场。",
     ),
     "tokenhub": Provider(
         key="tokenhub",
         label="TokenHub",
         base_url="",
-        models=[],
-        default_model="",
-        console_url="",
-        note="请在下方填写 TokenHub 控制台给出的 Base URL 与模型名（需为 OpenAI 兼容端点）。",
+        note="请填写 TokenHub 控制台给出的 Base URL 与模型名（需为 OpenAI 兼容端点）。",
     ),
     "custom": Provider(
         key="custom",
         label="自定义 OpenAI 兼容端点",
         base_url="",
-        models=[],
-        default_model="",
         note="任何兼容 /chat/completions 的服务都可以，包括本地 Ollama（http://localhost:11434/v1）。",
     ),
 }
@@ -81,8 +77,6 @@ def as_dict() -> list[dict]:
             "key": p.key,
             "label": p.label,
             "base_url": p.base_url,
-            "models": p.models,
-            "default_model": p.default_model,
             "console_url": p.console_url,
             "note": p.note,
             "needs_base_url": not p.base_url,

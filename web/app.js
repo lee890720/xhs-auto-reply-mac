@@ -413,30 +413,30 @@ function onProviderChange() {
   $('provider-note').textContent = p.note || '';
   $('llm-base_url').placeholder = p.base_url || '必填 —— 请填写服务商提供的 OpenAI 兼容端点';
 
-  // 模型名一律由用户填写，不预填也不静默回退到预设值——各家可用模型跟账号
-  // 开通情况有关，自动替换会让人不知道实际在跑哪个模型。
-  $('llm-model').placeholder = p.models.length
-    ? `必填，例如 ${p.models[0]}`
-    : '必填 —— 请填写模型名';
-
-  const dl = $('model-options');
-  dl.textContent = '';
-  for (const m of p.models) {
-    const o = document.createElement('option');
-    o.value = m;
-    dl.appendChild(o);
-  }
-
-  const hint = $('key-hint');
-  hint.textContent = 'Key 只保存在本机数据库，不会上传任何地方。';
+  // 模型名完全由用户填写：不预填、不给候选列表、不静默回退。
+  // 各家模型更新频繁且取决于账号开通情况，任何内置清单都会过时。
+  const hint = $('model-hint');
+  hint.textContent = '填写你账号实际开通的模型名。';
   if (p.console_url) {
     hint.appendChild(document.createTextNode(' '));
     const a = document.createElement('a');
     a.href = p.console_url;
     a.target = '_blank';
     a.rel = 'noopener';
-    a.textContent = '前往申请 →';
+    a.textContent = '去控制台查看 →';
     hint.appendChild(a);
+  }
+
+  const keyHint = $('key-hint');
+  keyHint.textContent = 'Key 只保存在本机数据库，不会上传任何地方。';
+  if (p.console_url) {
+    keyHint.appendChild(document.createTextNode(' '));
+    const a = document.createElement('a');
+    a.href = p.console_url;
+    a.target = '_blank';
+    a.rel = 'noopener';
+    a.textContent = '前往申请 →';
+    keyHint.appendChild(a);
   }
 }
 
