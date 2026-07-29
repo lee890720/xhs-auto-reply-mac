@@ -143,6 +143,13 @@ bash scripts/uninstall.sh
 
 ## 常见问题
 
+**点了 App 图标什么都没发生** — 先看屏幕右上角菜单栏，图标可能已经在那儿了（这个 App 不占 Dock）。
+如果确实没有，看 `logs/menubar.log`。已知两个坑都已规避，改代码时注意别踩回去：
+
+- `rumps.App(name=...)` 的 name 必须是 ASCII，用中文会静默不创建菜单栏项
+- launcher 脚本必须后台启动 python 再自己退出，用 `exec` 会让 python 成为
+  bundle 主进程，这种情况下 WindowServer 不给它创建菜单栏项
+
 **菜单栏图标显示 `书 ✕`** — 守护进程没在跑。点「重启守护进程」，或看 `logs/daemon.err.log`。
 
 **一直提示需要扫码** — 小红书登录态过期了。点「扫码登录小红书」，扫完回控制台点「重新检测」。

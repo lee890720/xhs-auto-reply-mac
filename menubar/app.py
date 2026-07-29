@@ -8,8 +8,11 @@
 这样即使关掉菜单栏 App，自动回复也照常运行；反过来菜单栏 App 崩了
 也不会带走守护进程。
 """
+import fcntl
 import json
+import os
 import subprocess
+import sys
 import urllib.error
 import urllib.request
 import webbrowser
@@ -21,9 +24,42 @@ APP_NAME = "XHSAutoReply"
 DATA_DIR = Path.home() / "Library" / "Application Support" / APP_NAME
 RUNTIME_FILE = DATA_DIR / "runtime.json"
 LOG_FILE = DATA_DIR / "logs" / "xhsd.log"
+LOCK_FILE = DATA_DIR / "menubar.lock"
 LAUNCH_LABEL = "com.xhs.autoreply.daemon"
 
 REQUEST_TIMEOUT = 4
+
+# 必须保持全局引用，否则文件描述符被回收会释放锁
+_lock_fd = None
+
+
+def acquire_lock() -> bool:
+    """
+    单实例检查。
+
+    用文件锁而不是 pgrep 匹配命令行——后者会被任何命令行里出现过
+    本脚本路径的无关进程（终端、编辑器）误伤，导致 App 点了没反应。
+    """
+    global _lock_fd
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _lock_fd = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    os.ftruncate(_lock_fd, 0)
+    os.write(_lock_fd, str(os.getpid()).encode())
+    return True
+
+
+def notify_already_running() -> None:
+    """已经在运行时给用户一个可见的反馈，而不是静默退出"""
+    subprocess.run(
+        ["osascript", "-e",
+         'display notification "图标就在屏幕右上角的菜单栏里" '
+         'with title "小红书自动回复" subtitle "已经在运行了"'],
+        check=False, capture_output=True,
+    )
 
 
 def read_base_url() -> str | None:
@@ -48,7 +84,9 @@ def http(method: str, path: str, timeout: int = REQUEST_TIMEOUT) -> dict | None:
 
 class MenuBarApp(rumps.App):
     def __init__(self):
-        super().__init__("小红书", title="书 ○", quit_button=None)
+        # name 必须是 ASCII —— 用中文时 rumps 会静默地不创建菜单栏项，
+        # 进程正常运行但图标永远不出现。中文只放在 title 里。
+        super().__init__("XHSAutoReply", title="书 ○", quit_button=None)
         self.status = None
 
         self.item_state = rumps.MenuItem("守护进程未运行")
@@ -177,5 +215,26 @@ def os_uid() -> int:
     return os.getuid()
 
 
+def become_accessory_app() -> None:
+    """
+    切换成 accessory 模式：只驻留菜单栏，不占 Dock、不抢焦点、不显示应用菜单。
+
+    Info.plist 里的 LSUIElement 管不到这个进程——真正运行的是 venv 里的
+    python 二进制，它读的是 Python.framework 自带的 Info.plist，所以要在
+    运行时显式设置。
+    """
+    try:
+        from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
+        NSApplication.sharedApplication().setActivationPolicy_(
+            NSApplicationActivationPolicyAccessory
+        )
+    except Exception:
+        pass          # 设置失败只是多占一个 Dock 图标，不影响功能
+
+
 if __name__ == "__main__":
+    if not acquire_lock():
+        notify_already_running()
+        sys.exit(0)
+    become_accessory_app()
     MenuBarApp().run()

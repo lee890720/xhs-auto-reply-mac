@@ -88,9 +88,17 @@ PLIST_EOF
 
 cat > "$APP_DIR/Contents/MacOS/launcher" <<LAUNCHER_EOF
 #!/bin/bash
-# 已经在跑就直接置前，避免重复开多个菜单栏图标
-if pgrep -f "menubar/app.py" > /dev/null; then exit 0; fi
-exec "$PYTHON" "$PROJECT_DIR/menubar/app.py"
+# 启动失败时这个日志是唯一线索——GUI 启动的进程没有终端可看
+exec >> "$LOG_DIR/menubar.log" 2>&1
+echo "--- \$(date '+%F %T') 启动菜单栏 App ---"
+
+# 必须后台启动再让 launcher 自己退出，不能用 exec。
+# 用 exec 时 python 会成为 .app bundle 的主进程，这种情况下 WindowServer
+# 不会给它创建菜单栏项——进程正常运行，但图标永远不出现。
+# 重复启动由 app.py 内的文件锁拦截。
+"$PYTHON" "$PROJECT_DIR/menubar/app.py" &
+disown
+exit 0
 LAUNCHER_EOF
 chmod +x "$APP_DIR/Contents/MacOS/launcher"
 
