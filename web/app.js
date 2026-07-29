@@ -76,7 +76,13 @@ function renderStatus(s) {
   else if (s.state === 'quiet' || s.state === 'starting') cls = 'warn';
 
   dot.className = 'dot ' + cls;
-  text.textContent = label + (s.running ? ` · 今日 ${s.today_sent}/${s.daily_limit}` : '');
+  const parts = [label];
+  if (s.running) {
+    parts.push(`今日 ${s.today_sent}/${s.daily_limit}`);
+    // 队列非空时明确显示，否则用户看不出后台还在按间隔逐条发
+    if (s.approved_waiting) parts.push(`待发 ${s.approved_waiting}`);
+  }
+  text.textContent = parts.join(' · ');
 
   const btn = $('btn-toggle');
   btn.textContent = s.running ? '停止' : '启动';
@@ -225,10 +231,18 @@ function buildItem(r) {
   tag.className = 'tag tag-' + r.status.replace('pending_review', 'pending');
   tag.textContent = STATUS_LABEL[r.status] || r.status;
 
+  // 两个时间必须分别标注：raw_time 是评论在小红书上的发布时间，
+  // 后面那个才是本系统的处理时间。并排放又不说明来源，会被读成
+  //「这条卡了 31 分钟没动」。
   const meta = document.createElement('span');
   meta.className = 'item-meta';
-  const when = r.sent_at || r.reviewed_at || r.created_at || '';
-  meta.textContent = [r.raw_time, when.replace('T', ' ')].filter(Boolean).join(' · ');
+  const clock = (ts) => (ts || '').slice(11, 19);
+  const bits = [];
+  if (r.raw_time) bits.push(`评论于 ${r.raw_time}`);
+  if (r.status === 'sent' && r.sent_at) bits.push(`已发送 ${clock(r.sent_at)}`);
+  else if (r.status === 'approved') bits.push('排队中，按发送间隔依次发出');
+  else if (r.created_at) bits.push(`采集于 ${clock(r.created_at)}`);
+  meta.textContent = bits.join(' · ');
 
   head.append(author, tag, meta);
 
@@ -398,7 +412,12 @@ function onProviderChange() {
 
   $('provider-note').textContent = p.note || '';
   $('llm-base_url').placeholder = p.base_url || '必填 —— 请填写服务商提供的 OpenAI 兼容端点';
-  $('llm-model').placeholder = p.default_model || '必填 —— 请填写模型名';
+
+  // 模型名一律由用户填写，不预填也不静默回退到预设值——各家可用模型跟账号
+  // 开通情况有关，自动替换会让人不知道实际在跑哪个模型。
+  $('llm-model').placeholder = p.models.length
+    ? `必填，例如 ${p.models[0]}`
+    : '必填 —— 请填写模型名';
 
   const dl = $('model-options');
   dl.textContent = '';

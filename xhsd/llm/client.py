@@ -28,7 +28,7 @@ class ChatClient:
         if not self.base_url:
             raise LLMError(f"服务商 {self.cfg.provider} 需要手动填写 Base URL")
         if not self.model:
-            raise LLMError(f"服务商 {self.cfg.provider} 需要手动填写模型名")
+            raise LLMError("尚未填写模型名，请在控制台「模型 API → 模型」中填写")
 
     async def complete(self, system_prompt: str, user_prompt: str) -> str:
         """发起一次对话补全，返回纯文本回复"""

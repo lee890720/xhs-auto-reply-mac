@@ -64,12 +64,14 @@ def get(key: str) -> Provider:
 def resolve(provider_key: str, base_url: str, model: str) -> tuple[str, str]:
     """
     合并用户配置与预设，得出实际使用的 base_url 和 model。
-    用户显式填写的值优先。
+
+    base_url 可以回退到预设（端点是固定的，且填错会立刻报错）；
+    模型名不回退——各家可用模型跟账号权限、开通情况有关，静默替换成预设值
+    会让人以为在用 A 模型、实际跑的是 B。留空时直接报错要求填写。
     """
     preset = get(provider_key)
     final_base = (base_url or preset.base_url).rstrip("/")
-    final_model = model or preset.default_model
-    return final_base, final_model
+    return final_base, model.strip()
 
 
 def as_dict() -> list[dict]:
