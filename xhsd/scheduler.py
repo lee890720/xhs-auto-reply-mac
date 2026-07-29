@@ -13,7 +13,7 @@ from datetime import datetime, time as dtime
 from loguru import logger
 
 from . import db, settings_store
-from .collector import BrowserSession, NotLoggedIn, RawComment
+from .collector import BrowserSession, NotLoggedIn, RawComment, ReplyTargetGone
 from .generator import ReplyGenerator, SensitiveHit
 from .llm import LLMError
 
@@ -272,6 +272,11 @@ class Engine:
                 self.state = "need_login"
                 logger.error(f"发送时发现登录态失效: {e}")
                 return
+            except ReplyTargetGone as e:
+                # 评论已经不在了，重试没有意义，直接判失败继续处理下一条
+                db.update_reply_status(row["id"], db.STATUS_FAILED, error=str(e))
+                logger.warning(f"放弃回复 {row['author']}: {e}")
+                continue
             except Exception as e:
                 attempts = (row["attempts"] or 0) + 1
                 if attempts >= MAX_SEND_ATTEMPTS:

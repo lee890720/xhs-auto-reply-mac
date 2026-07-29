@@ -30,6 +30,16 @@ from .paths import BROWSER_DIR, SCREENSHOT_DIR, ensure_dirs
 NOTIFICATION_URL = "https://www.xiaohongshu.com/notification"
 HOME_URL = "https://www.xiaohongshu.com"
 
+# 评论被删除后，通知页会留下一条占位记录。它没有回复按钮，内容是下面这些
+# 固定文案。真正的过滤依据是「有没有 .action-reply」，这里只作二次确认。
+PLACEHOLDER_CONTENTS = {
+    "原评论已删除",
+    "该评论已删除",
+    "评论已删除",
+    "笔记已删除",
+    "该内容已删除",
+}
+
 
 class NotLoggedIn(Exception):
     """浏览器里的小红书登录态失效，需要人工扫码"""
@@ -37,6 +47,13 @@ class NotLoggedIn(Exception):
 
 class BrowserUnavailable(Exception):
     """浏览器未启动或已崩溃"""
+
+
+class ReplyTargetGone(Exception):
+    """
+    目标评论在页面上已经找不到了——通常是评论被作者删除。
+    这种失败重试多少次都一样，调度器会直接判失败，不占用重试次数。
+    """
 
 
 @dataclass
@@ -146,15 +163,24 @@ class BrowserSession:
     async def _goto_notifications(self) -> None:
         assert self.page is not None
         await self.page.goto(NOTIFICATION_URL, wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(4)
+
         # 切到「评论和@」tab
         try:
             tab = await self.page.query_selector("text=评论和@")
             if tab:
                 await tab.click()
-                await asyncio.sleep(2.5)
         except Exception:
             pass
+
+        # 通知列表是异步渲染的，固定 sleep 会读到只加载了一两条的中间态。
+        # 先等第一条出现，再留一点时间让剩余条目渲染完。
+        try:
+            await self.page.wait_for_selector(
+                ".notification-page .container", timeout=15000
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(3)
 
     async def collect(self, limit: int = 5) -> list[RawComment]:
         """采集通知页上的评论"""
@@ -173,9 +199,20 @@ class BrowserSession:
 
         logger.info(f"通知页发现 {len(items)} 条通知")
         out: list[RawComment] = []
+        skipped = 0
 
-        for item in items[:limit]:
+        # 注意先过滤再计数：如果先按 limit 截断，开头连续几条删除残骸会把
+        # 真正需要回复的评论全挤出这一轮。
+        for item in items:
+            if len(out) >= limit:
+                break
             try:
+                # 没有回复按钮就是不可回复的条目——评论被删后的占位记录、
+                # 点赞收藏类通知都属于这种。这是最可靠的判据。
+                if not await item.query_selector(".action-reply"):
+                    skipped += 1
+                    continue
+
                 author_el = await item.query_selector(".user-info a")
                 if not author_el:
                     continue
@@ -185,7 +222,8 @@ class BrowserSession:
 
                 content_el = await item.query_selector(".interaction-content")
                 content = (await content_el.inner_text()).strip()[:500] if content_el else ""
-                if not content:
+                if not content or content in PLACEHOLDER_CONTENTS:
+                    skipped += 1
                     continue
 
                 time_el = await item.query_selector(".interaction-time")
@@ -199,6 +237,8 @@ class BrowserSession:
                 logger.debug(f"解析通知条目失败: {e}")
                 continue
 
+        if skipped:
+            logger.info(f"跳过 {skipped} 条不可回复的通知（已删除评论等）")
         return out
 
     async def _looks_logged_in(self) -> bool:
@@ -246,8 +286,10 @@ class BrowserSession:
         )
 
         if not clicked:
-            shot = await self.screenshot("reply-target-not-found")
-            raise RuntimeError(f"未找到 {author} 的回复按钮（截图: {shot}）")
+            await self.screenshot("reply-target-not-found")
+            raise ReplyTargetGone(
+                f"页面上已找不到 {author} 的这条评论，可能已被对方删除"
+            )
 
         await asyncio.sleep(random.uniform(1.0, 2.0))
 

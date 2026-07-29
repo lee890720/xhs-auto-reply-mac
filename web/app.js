@@ -239,9 +239,13 @@ function buildItem(r) {
   if (r.note_image_url) {
     const img = document.createElement('img');
     img.className = 'item-thumb';
+    // 小红书 CDN 会校验 Referer，带上本地地址会被拒，图片显示成破图
+    img.referrerPolicy = 'no-referrer';
     img.src = r.note_image_url;          // 作为 src 属性赋值，不参与 HTML 解析
     img.loading = 'lazy';
+    img.alt = '';                        // 加载失败时不显示 alt 文字占位
     img.title = '点击查看大图';
+    img.onerror = () => img.remove();    // 仍然失败就移除，别留个破图框
     img.onclick = () => window.open(r.note_image_url, '_blank', 'noopener');
     body.appendChild(img);
   }
