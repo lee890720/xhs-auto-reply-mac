@@ -1,5 +1,0 @@
-playwright==1.48.0
-httpx==0.27.2
-pydantic==2.9.2
-pydantic-settings==2.6.0
-loguru==0.7.2
