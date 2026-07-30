@@ -154,6 +154,15 @@ Launchpad 里搜「小红书自动回复」并点击。图标 `书 ○` 会出�
 
 **设置 → 回复人设**。默认人设是通用的，按你的账号定位改写。改完立即生效。
 
+改写时有两处别删掉：
+
+- **具体的负向约束**（不准以「哈哈」开头、不准每条都带 emoji、不准用「～」、
+  不准叫对方昵称）。写成「语气自然」这种抽象要求时，模型给出的是它以为的自然，
+  实测是十条里八条以「哈哈」开头、条条带 emoji。
+- **`[SKIP]` 相关的规则**。它是模型的弃答开关：辱骂、贬称反问、引战立场、
+  质疑你是机器人、只有 `[图片]` 的评论都靠它拦下来转人工。删掉之后这些评论会被
+  硬编出一句得体回复，结果通常是「哈哈，欢迎你呀」这种自证愚蠢的答复。
+
 ### 4. 开始监控
 
 菜单栏 → **开始监控**。
@@ -293,7 +302,24 @@ launchctl bootout gui/$UID/com.xhs.autoreply.daemon && .venv/bin/python -m xhsd
 git pull && launchctl kickstart -k gui/$UID/com.xhs.autoreply.daemon
 ```
 
-依赖有变动时重跑 `bash scripts/install.sh`。
+依赖有变动时重跑 `bash scripts/install.sh`。数据库表结构的变动在启动时自动完成，
+不用手动处理，历史数据不受影响。
+
+**注意：代码里的默认回复人设不会覆盖你已保存的那一份。** 配置存在数据库里，
+始终以控制台里填的为准——这是有意的，否则每次升级都会冲掉你的改写。
+代价是人设的改进不会自动生效，升级后回复语气还是老样子。
+
+要用新版默认人设覆盖，先备份现有的：
+
+```bash
+.venv/bin/python -c "from xhsd import settings_store as s; print(s.load().persona.system_prompt)" > ~/Desktop/persona-backup.txt
+```
+
+再覆盖（改完立即生效，不用重启）：
+
+```bash
+.venv/bin/python -c "from xhsd import settings_store as s; s.save_section('persona', {'system_prompt': s.DEFAULT_PERSONA})"
+```
 
 ### 清理历史数据
 
@@ -353,6 +379,16 @@ Chromium 内核缺失或版本不匹配：
 4. 队列是不是在正常消化——发送间隔 8–30 秒随机，5 条要 1–2 分钟，
    状态栏会显示 `待发 N`
 
+### 有不少评论一条都没回
+
+先看「敏感词拦截」筛选里有没有堆积。除了命中敏感词，模型判断不宜回复的评论
+也会进这个队列（`error` 写着「模型判断不宜回复」），包括辱骂、贬称反问、
+引战立场、质疑你是机器人、只有 `[图片]` `[视频]` 的评论。
+
+**这个比例可能不低。** 实测一个评论区有争议内容的账号，22 条里 12 条弃答。
+这不是故障——强行回复这些评论比不回更糟。逐条人工处理，或者觉得太严就在
+人设里放松 `[SKIP]` 的判定范围。
+
 ### 找不到页面元素 / 回复发送失败
 
 小红书改版了。`~/Library/Application Support/XHSAutoReply/screenshots/` 里有失败现场截图，
@@ -360,6 +396,28 @@ Chromium 内核缺失或版本不匹配：
 
 采集的过滤依据是「条目内有没有 `.action-reply`」，改版后若该类名变化，
 会表现为一条评论都采不到。
+
+### 回复变得泛泛而谈、开始跑题
+
+说明笔记上下文没拿到。日志里会有这两条之一：
+
+- `N 条评论未能对上 mentions 接口数据` —— 通知页的
+  `/api/sns/web/v1/you/mentions` 接口变了（路径、字段名，或返回顺序与页面
+  渲染顺序不再一致）。见 `xhsd/collector.py` 的 `_absorb_mentions`
+  和 `_match_meta`。
+- `抓取笔记 xxx 失败` —— 笔记详情页的 `__INITIAL_STATE__` 结构变了，
+  见 `fetch_note`。注意不能改用 `.title` 这类选择器抓 DOM，explore 页右侧
+  有推荐笔记流，会命中别人的笔记。
+
+审核队列里每条评论上方会显示它所属的笔记，没有笔记内容时显示
+「这篇笔记没取到文字内容」，据此判断是全局失效还是个别笔记的问题。
+
+笔记内容缓存在 `notes` 表，抓成功过就不再抓。改完选择器要重试某篇笔记，
+清掉它的缓存行即可：
+
+```bash
+sqlite3 ~/Library/Application\ Support/XHSAutoReply/data.db "DELETE FROM notes WHERE note_id='粘贴note_id';"
+```
 
 ### 系统重启后不工作了
 
