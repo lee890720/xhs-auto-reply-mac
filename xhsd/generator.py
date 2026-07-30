@@ -40,6 +40,14 @@ def check_sensitive(content: str, keywords: list[str]) -> str | None:
     return None
 
 
+def check_forbidden(reply: str, forbidden: list[str]) -> str:
+    """检查生成的回复里有没有禁用词，返回命中的词，没有则返回空串"""
+    for word in forbidden:
+        if word and word in reply:
+            return word
+    return ""
+
+
 def build_user_prompt(
     author: str,
     content: str,
@@ -152,18 +160,34 @@ class ReplyGenerator:
                 return self.cfg.safety.fallback_text
             raise SensitiveHit(hit)
 
-        raw = await self.client.complete(
-            self.cfg.persona.system_prompt,
-            build_user_prompt(
-                author, content, note_title, msg_type,
-                note_body=note_body,
-                note_tags=note_tags,
-                max_note_chars=self.cfg.reply.note_context_chars,
-            ),
+        prompt = build_user_prompt(
+            author, content, note_title, msg_type,
+            note_body=note_body,
+            note_tags=note_tags,
+            max_note_chars=self.cfg.reply.note_context_chars,
         )
-        cleaned = clean_output(raw)
-        if _SKIP_PATTERN.match(cleaned):
-            raise SkipReply(f"模型判断这条不宜回复: {content[:40]}")
-        if not cleaned:
-            raise LLMError("清洗后回复为空")
-        return cleaned
+
+        # 禁用词命中就重来一次。人设里的禁令是概率约束，温度 0.9 下压不住——
+        # 尤其笔记正文自己写着「拉群约球」时，模型很容易把原话搬进回复。
+        hit = ""
+        for attempt in range(2):
+            user_prompt = prompt
+            if hit:
+                user_prompt += (
+                    f"\n\n注意：刚才那版回复里出现了「{hit}」，这是不允许的。"
+                    f"重写一条，不要提到{hit}，需要进一步沟通就只说私信。"
+                )
+            raw = await self.client.complete(self.cfg.persona.system_prompt, user_prompt)
+            cleaned = clean_output(raw)
+
+            if _SKIP_PATTERN.match(cleaned):
+                raise SkipReply(f"模型判断这条不宜回复: {content[:40]}")
+            if not cleaned:
+                raise LLMError("清洗后回复为空")
+
+            hit = check_forbidden(cleaned, self.cfg.safety.forbidden_in_reply)
+            if not hit:
+                return cleaned
+            logger.warning(f"回复含禁用词「{hit}」，重新生成: {cleaned}")
+
+        raise SkipReply(f"重写后仍含禁用词「{hit}」，转人工")

@@ -262,6 +262,14 @@
         <span class="field-label">兜底话术</span>
         <input type="text" id="safety-fallback_text">
       </label>
+      <label class="field">
+        <span class="field-label">回复里的禁用词（一行一个）</span>
+        <textarea id="safety-forbidden_in_reply" rows="6"></textarea>
+        <span class="field-hint">
+          针对生成出来的回复，不是评论。命中就重新生成一次，再命中转人工。
+          默认禁止在评论区提群——引导私信就够了，拉群的事私信里再说。
+        </span>
+      </label>
       <div class="form-actions">
         <button class="btn btn-primary" onclick="saveSection('safety')">保存</button>
         <span class="form-msg" id="msg-safety"></span>

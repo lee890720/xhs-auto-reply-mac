@@ -424,6 +424,7 @@ function fillForm(cfg) {
   set('safety-sensitive_keywords', cfg.safety.sensitive_keywords.join('\n'));
   set('safety-on_sensitive', cfg.safety.on_sensitive);
   set('safety-fallback_text', cfg.safety.fallback_text);
+  set('safety-forbidden_in_reply', (cfg.safety.forbidden_in_reply || []).join('\n'));
 }
 
 function onProviderChange() {
@@ -487,6 +488,8 @@ function collectSection(name) {
       .split('\n').map(s => s.trim()).filter(Boolean),
     on_sensitive: $('safety-on_sensitive').value,
     fallback_text: $('safety-fallback_text').value.trim(),
+    forbidden_in_reply: $('safety-forbidden_in_reply').value
+      .split('\n').map(s => s.trim()).filter(Boolean),
   };
   return {};
 }
