@@ -20,6 +20,19 @@ class SensitiveHit(Exception):
         super().__init__(f"命中敏感词: {keyword}")
 
 
+class SkipReply(Exception):
+    """
+    模型判断这条评论不该回复（挑衅、辱骂、立场争论、纯表情等）。
+
+    敏感词表列不完这些情况，而强迫模型对一句辱骂编出得体回复，
+    结果只会是「哈哈，欢迎你呀」这种自取其辱的答复。不如让它有权弃答。
+    """
+
+
+# 模型弃答时输出的标记。宽松匹配：模型可能带引号、方括号或多余空白。
+_SKIP_PATTERN = re.compile(r"^\W*skip\W*$", re.IGNORECASE)
+
+
 def check_sensitive(content: str, keywords: list[str]) -> str | None:
     for kw in keywords:
         if kw and kw in content:
@@ -27,14 +40,58 @@ def check_sensitive(content: str, keywords: list[str]) -> str | None:
     return None
 
 
-def build_user_prompt(author: str, content: str, note_title: str, msg_type: str) -> str:
-    """把一条评论组装成给模型的输入"""
+def build_user_prompt(
+    author: str,
+    content: str,
+    note_title: str,
+    msg_type: str,
+    note_body: str = "",
+    note_tags: str = "",
+    max_note_chars: int = 600,
+) -> str:
+    """
+    把一条评论组装成给模型的输入。
+
+    笔记内容是回复质量的关键：评论往往是接着笔记的话说的（笔记在约跑步，
+    评论「约起来，我可以」），没有笔记上下文时模型只能泛泛而谈甚至跑题。
+    这里传笔记原文而不是提取关键词 —— 小红书正文本身就短，再提炼只会丢信息。
+    """
     label = "评论" if msg_type == "comment" else "私信"
     lines = []
+
+    note_parts = []
     if note_title:
-        lines.append(f"你的笔记标题：{note_title}")
-    lines.append(f"用户「{author}」的{label}：{content}")
-    lines.append("")
+        note_parts.append(f"标题：{note_title}")
+    if note_body:
+        body = note_body[:max_note_chars]
+        if len(note_body) > max_note_chars:
+            body += "…"
+        note_parts.append(f"正文：{body}")
+    if note_tags:
+        note_parts.append(f"话题标签：{note_tags}")
+
+    if note_parts:
+        lines.append("【你发布的笔记】")
+        lines.extend(note_parts)
+        lines.append("")
+        lines.append(f"【一位昵称为「{author}」的用户在这篇笔记下的{label}】")
+        lines.append(content)
+        lines.append("")
+        lines.append(
+            "请结合笔记内容回复。评论多半是接着笔记的话题说的，"
+            "要回到具体这件事上，不要说放之四海皆可的泛泛之词。"
+        )
+    else:
+        # 拿不到笔记内容时如实说明，避免模型脑补出一个不存在的话题
+        lines.append(f"一位昵称为「{author}」的用户发来{label}：{content}")
+        lines.append("")
+        lines.append(
+            "（这条评论所属的笔记内容暂时取不到。）"
+            "请只针对评论本身简短回应，宁可含糊也不要猜测笔记讲了什么。"
+        )
+
+    # 昵称只用于让模型知道是谁在说话，不能出现在回复里
+    lines.append("上面的昵称只是告诉你这条是谁发的，回复里不要提到这个昵称。")
     lines.append("请直接给出你的回复正文，不要加引号，不要加任何解释。")
     return "\n".join(lines)
 
@@ -73,7 +130,13 @@ class ReplyGenerator:
         self.client = ChatClient(cfg.llm)
 
     async def generate(
-        self, author: str, content: str, note_title: str = "", msg_type: str = "comment"
+        self,
+        author: str,
+        content: str,
+        note_title: str = "",
+        msg_type: str = "comment",
+        note_body: str = "",
+        note_tags: str = "",
     ) -> str:
         """
         生成回复正文。
@@ -91,9 +154,16 @@ class ReplyGenerator:
 
         raw = await self.client.complete(
             self.cfg.persona.system_prompt,
-            build_user_prompt(author, content, note_title, msg_type),
+            build_user_prompt(
+                author, content, note_title, msg_type,
+                note_body=note_body,
+                note_tags=note_tags,
+                max_note_chars=self.cfg.reply.note_context_chars,
+            ),
         )
         cleaned = clean_output(raw)
+        if _SKIP_PATTERN.match(cleaned):
+            raise SkipReply(f"模型判断这条不宜回复: {content[:40]}")
         if not cleaned:
             raise LLMError("清洗后回复为空")
         return cleaned

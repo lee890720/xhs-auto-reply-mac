@@ -14,7 +14,7 @@ from loguru import logger
 
 from . import db, settings_store
 from .collector import BrowserSession, NotLoggedIn, RawComment, ReplyTargetGone
-from .generator import ReplyGenerator, SensitiveHit
+from .generator import ReplyGenerator, SensitiveHit, SkipReply
 from .llm import LLMError
 
 MAX_SEND_ATTEMPTS = 3
@@ -182,6 +182,9 @@ class Engine:
                 content=c.content,
                 note_image_url=c.note_image_url,
                 raw_time=c.raw_time,
+                note_id=c.note_id,
+                comment_id=c.comment_id,
+                note_xsec_token=c.note_xsec_token,
             )
             if msg_id:                       # None 表示指纹已存在，之前处理过
                 fresh.append((msg_id, c))
@@ -191,10 +194,67 @@ class Engine:
             return
 
         logger.info(f"本轮新增 {len(fresh)} 条评论，开始生成草稿")
-        generator = ReplyGenerator(cfg)
 
+        # 先补齐笔记正文再生成 —— 没有笔记上下文的回复必然泛泛而谈或跑题
+        await self._ensure_notes(fresh)
+
+        generator = ReplyGenerator(cfg)
         for msg_id, c in fresh:
-            await self._draft_one(generator, cfg, msg_id, c.author, c.content)
+            await self._draft_one(generator, cfg, msg_id, c.author, c.content, c.note_id)
+
+    async def _ensure_notes(self, fresh: list[tuple[int, RawComment]]) -> None:
+        """
+        把本轮涉及到的笔记正文抓下来存库。
+
+        按 note_id 去重再抓：同一篇笔记下往往有多条评论，一篇只需开一次详情页。
+        抓取失败不阻断生成流程，只是这条评论会退化成无上下文回复。
+        """
+        pending: dict[str, RawComment] = {}   # note_id -> 任一条引用它的评论
+        for _, c in fresh:
+            if c.note_id and c.note_id not in pending and db.note_needs_fetch(c.note_id):
+                pending[c.note_id] = c
+
+        if not pending:
+            logger.debug("本轮涉及的笔记都已缓存，无需抓取")
+            return
+
+        logger.info(f"需要抓取 {len(pending)} 篇笔记的正文")
+        for note_id, ref in pending.items():
+            token = ref.note_xsec_token
+            try:
+                note = await self.browser.fetch_note(note_id, token)
+            except NotLoggedIn as e:
+                self.need_login = True
+                self.state = "need_login"
+                self.last_error = str(e)
+                logger.error(f"抓取笔记时登录态失效: {e}")
+                return
+            except Exception as e:
+                # 退而用 mentions 接口顺带给的标题，好过完全没有上下文。
+                # 仍记 fetch_error，以便之后重试拿完整正文。
+                db.upsert_note(
+                    note_id, title=ref.note_title, xsec_token=token, fetch_error=str(e)
+                )
+                logger.warning(
+                    f"抓取笔记 {note_id} 失败: {e}"
+                    + (f"（降级使用标题「{ref.note_title}」）" if ref.note_title else "")
+                )
+                continue
+
+            db.upsert_note(
+                note_id=note.note_id,
+                title=note.title or ref.note_title,
+                body=note.body,
+                tags=" ".join(note.tags),
+                note_type=note.note_type,
+                xsec_token=token,
+            )
+            if note.is_empty:
+                logger.warning(f"笔记 {note_id} 没有任何文字内容（可能是纯图片或视频笔记）")
+            else:
+                logger.info(f"笔记 {note_id} 内容已缓存: {(note.title or note.body)[:40]}")
+
+        # 这里不必导航回通知页：collect 和 send_reply 都会自己先 goto 通知页
 
     async def _draft_one(
         self,
@@ -203,13 +263,28 @@ class Engine:
         msg_id: int,
         author: str,
         content: str,
+        note_id: str = "",
     ) -> None:
         provider, model = cfg.llm.provider, generator.client.model
+        note = db.get_note(note_id) if note_id else None
+        note_title = (note or {}).get("title", "")
+        note_body = (note or {}).get("body", "")
+        has_context = bool(note_title or note_body)
+
         try:
-            draft = await generator.generate(author, content, msg_type="comment")
+            draft = await generator.generate(
+                author, content, note_title, msg_type="comment",
+                note_body=note_body,
+                note_tags=(note or {}).get("tags", ""),
+            )
         except SensitiveHit as e:
             db.insert_reply(msg_id, "", db.STATUS_BLOCKED, provider, model)
             logger.warning(f"「{author}」的评论命中敏感词「{e.keyword}」，已转人工")
+            return
+        except SkipReply as e:
+            rid = db.insert_reply(msg_id, "", db.STATUS_BLOCKED, provider, model)
+            db.update_reply_status(rid, db.STATUS_BLOCKED, error="模型判断不宜回复")
+            logger.info(f"「{author}」的评论不宜回复，已跳过: {e}")
             return
         except LLMError as e:
             rid = db.insert_reply(msg_id, "", db.STATUS_PENDING_REVIEW, provider, model)
@@ -218,24 +293,62 @@ class Engine:
             return
 
         # 全自动模式直接进发送队列；审核模式进待审队列
-        status = db.STATUS_APPROVED if cfg.reply.mode == "auto" else db.STATUS_PENDING_REVIEW
+        auto = cfg.reply.mode == "auto"
+        if auto and not has_context and cfg.reply.require_note_context:
+            # 没有笔记上下文的回复容易跑题，按配置转人工而不是直接发出去
+            rid = db.insert_reply(msg_id, draft, db.STATUS_PENDING_REVIEW, provider, model)
+            db.update_reply_status(
+                rid, db.STATUS_PENDING_REVIEW, error="缺少笔记上下文，已转人工"
+            )
+            logger.warning(f"「{author}」的评论取不到笔记内容，草稿转人工审核")
+            return
+
+        status = db.STATUS_APPROVED if auto else db.STATUS_PENDING_REVIEW
         db.insert_reply(msg_id, draft, status, provider, model)
-        logger.info(f"草稿已生成（{author}）: {draft[:40]}")
+        logger.info(
+            f"草稿已生成（{author}{'' if has_context else '，无笔记上下文'}）: {draft[:40]}"
+        )
 
     async def regenerate(self, reply_id: int) -> tuple[bool, str]:
         """重新生成某条草稿，供控制台「重新生成」按钮调用"""
         row = db.get_reply(reply_id)
         if not row:
             return False, "记录不存在"
+        # 重新生成会把状态改回待审。对已发送的记录做这件事等于让它重回队列，
+        # 批准后就是对同一条评论回复第二次。
+        if row["status"] in (db.STATUS_SENT, db.STATUS_APPROVED):
+            return False, "这条已经发送或正在发送队列中，不能重新生成"
 
         cfg = settings_store.load()
+
+        # 重新生成时补一次笔记抓取：上次可能是网络抖动导致没拿到上下文
+        note_id = row.get("note_id") or ""
+        if note_id and db.note_needs_fetch(note_id):
+            async with self._lock:
+                token = ((db.get_note(note_id) or {}).get("xsec_token")
+                         or row.get("note_xsec_token") or "")
+                try:
+                    note = await self.browser.fetch_note(note_id, token)
+                    db.upsert_note(
+                        note_id=note.note_id, title=note.title, body=note.body,
+                        tags=" ".join(note.tags), note_type=note.note_type,
+                        xsec_token=token,
+                    )
+                    row = db.get_reply(reply_id) or row
+                except Exception as e:
+                    logger.warning(f"重新生成时抓取笔记 {note_id} 失败: {e}")
+
         generator = ReplyGenerator(cfg)
         try:
             draft = await generator.generate(
-                row["author"], row["content"], row["note_title"], row["msg_type"]
+                row["author"], row["content"], row["note_title"], row["msg_type"],
+                note_body=row.get("note_body", ""),
+                note_tags=row.get("note_tags", ""),
             )
         except SensitiveHit as e:
             return False, f"命中敏感词「{e.keyword}」"
+        except SkipReply:
+            return False, "模型判断这条评论不宜回复"
         except LLMError as e:
             return False, str(e)
 

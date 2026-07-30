@@ -27,6 +27,19 @@ CREATE TABLE IF NOT EXISTS messages (
     collected_at  TEXT    NOT NULL
 );
 
+-- 笔记正文缓存。评论脱离笔记无法理解（「约起来，我可以」得看到笔记在约跑步），
+-- 但同一篇笔记下往往有几十条评论，按 note_id 缓存，避免每条都去开一次详情页。
+CREATE TABLE IF NOT EXISTS notes (
+    note_id     TEXT PRIMARY KEY,
+    title       TEXT NOT NULL DEFAULT '',
+    body        TEXT NOT NULL DEFAULT '',
+    tags        TEXT NOT NULL DEFAULT '',
+    note_type   TEXT NOT NULL DEFAULT '',
+    xsec_token  TEXT NOT NULL DEFAULT '',
+    fetch_error TEXT NOT NULL DEFAULT '',
+    fetched_at  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS replies (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     message_id  INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
@@ -95,10 +108,24 @@ def connect() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+# 后续版本新增的 messages 列。已有库不会重建表，靠 ALTER TABLE 补齐。
+_MESSAGE_COLUMNS = {
+    "note_id": "TEXT NOT NULL DEFAULT ''",
+    "comment_id": "TEXT NOT NULL DEFAULT ''",
+    # 访问笔记详情页的凭证。存在消息上而不只存在 notes 表里，
+    # 这样即使笔记一直没抓成功，之后重试也还有 token 可用。
+    "note_xsec_token": "TEXT NOT NULL DEFAULT ''",
+}
+
+
 def init_db() -> None:
     """建表。幂等，每次启动都会调用"""
     with connect() as conn:
         conn.executescript(SCHEMA)
+        existing = {r["name"] for r in conn.execute("PRAGMA table_info(messages)")}
+        for col, decl in _MESSAGE_COLUMNS.items():
+            if col not in existing:
+                conn.execute(f"ALTER TABLE messages ADD COLUMN {col} {decl}")
 
 
 def query(sql: str, params: tuple = ()) -> list[dict[str, Any]]:
@@ -134,6 +161,9 @@ def insert_message(
     note_title: str = "",
     note_image_url: str = "",
     raw_time: str = "",
+    note_id: str = "",
+    comment_id: str = "",
+    note_xsec_token: str = "",
 ) -> int | None:
     """
     插入消息。若指纹已存在返回 None（表示此消息之前已处理过）。
@@ -144,14 +174,69 @@ def insert_message(
             cur = conn.execute(
                 """INSERT INTO messages
                    (fingerprint, msg_type, author, content, note_title,
-                    note_image_url, raw_time, collected_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    note_image_url, raw_time, note_id, comment_id,
+                    note_xsec_token, collected_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (fingerprint, msg_type, author, content, note_title,
-                 note_image_url, raw_time, now()),
+                 note_image_url, raw_time, note_id, comment_id,
+                 note_xsec_token, now()),
             )
             return cur.lastrowid
         except sqlite3.IntegrityError:
             return None
+
+
+# ==================== 笔记缓存 ====================
+
+def get_note(note_id: str) -> dict | None:
+    return query_one("SELECT * FROM notes WHERE note_id = ?", (note_id,))
+
+
+def upsert_note(
+    note_id: str,
+    title: str = "",
+    body: str = "",
+    tags: str = "",
+    note_type: str = "",
+    xsec_token: str = "",
+    fetch_error: str = "",
+) -> None:
+    execute(
+        """INSERT INTO notes
+           (note_id, title, body, tags, note_type, xsec_token, fetch_error, fetched_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(note_id) DO UPDATE SET
+               title       = excluded.title,
+               body        = excluded.body,
+               tags        = excluded.tags,
+               note_type   = excluded.note_type,
+               xsec_token  = excluded.xsec_token,
+               fetch_error = excluded.fetch_error,
+               fetched_at  = excluded.fetched_at""",
+        (note_id, title, body, tags, note_type, xsec_token, fetch_error, now()),
+    )
+
+
+def note_needs_fetch(note_id: str, retry_after_hours: int = 6) -> bool:
+    """
+    判断是否要去抓这篇笔记。
+
+    这是控制抓取成本的唯一开关，所以判据是「上次抓取有没有成功」而不是
+    「有没有拿到文字」—— 纯图片和视频笔记本来就没有正文，按后者判会导致
+    每隔几小时重试一次，永远抓不到东西。
+    只有真正失败（笔记被删、网络抖动、页面改版）才值得重试。
+    """
+    row = get_note(note_id)
+    if row is None:
+        return True
+    if not row["fetch_error"]:
+        return False                      # 抓成功过。笔记发布后基本不改，不再抓
+    from datetime import timedelta
+    try:
+        last = datetime.fromisoformat(row["fetched_at"])
+    except (ValueError, TypeError):
+        return True
+    return datetime.now() - last > timedelta(hours=retry_after_hours)
 
 
 # ==================== 回复 ====================
@@ -206,9 +291,14 @@ def bump_attempts(reply_id: int) -> None:
 REPLY_JOIN = """
 SELECT r.id, r.message_id, r.draft, r.final_text, r.status, r.provider,
        r.model, r.error, r.attempts, r.created_at, r.reviewed_at, r.sent_at,
-       m.author, m.content, m.msg_type, m.note_title, m.note_image_url, m.raw_time
+       m.author, m.content, m.msg_type, m.note_image_url, m.raw_time,
+       m.note_id, m.comment_id, m.note_xsec_token,
+       COALESCE(n.title, m.note_title) AS note_title,
+       COALESCE(n.body, '')            AS note_body,
+       COALESCE(n.tags, '')            AS note_tags
 FROM replies r
 JOIN messages m ON m.id = r.message_id
+LEFT JOIN notes n ON n.note_id = m.note_id
 """
 
 

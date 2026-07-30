@@ -14,11 +14,16 @@ DOM 结构（沿用旧版实测结论）：
     时间       .interaction-time
     笔记封面   .extra img.extra-image
     回复按钮   .action-reply
+
+笔记归属信息不在 DOM 里 —— 通知条目只有封面图和用户主页链接，没有笔记链接。
+note_id 只能从通知页自己请求的 mentions 接口响应里拿，所以这里顺带拦截它。
+拿到 note_id 后再开详情页读 __INITIAL_STATE__ 取正文，供生成回复时理解上下文。
 """
 import asyncio
 import hashlib
 import random
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -29,6 +34,9 @@ from .paths import BROWSER_DIR, SCREENSHOT_DIR, ensure_dirs
 
 NOTIFICATION_URL = "https://www.xiaohongshu.com/notification"
 HOME_URL = "https://www.xiaohongshu.com"
+NOTE_URL = "https://www.xiaohongshu.com/explore/{note_id}?xsec_token={token}&xsec_source=pc_notice"
+# 通知页拉取「评论和@」列表的接口，响应里带 note_id 与访问笔记所需的 xsec_token
+MENTIONS_API = "/api/sns/web/v1/you/mentions"
 
 # 评论被删除后，通知页会留下一条占位记录。它没有回复按钮，内容是下面这些
 # 固定文案。真正的过滤依据是「有没有 .action-reply」，这里只作二次确认。
@@ -39,6 +47,15 @@ PLACEHOLDER_CONTENTS = {
     "笔记已删除",
     "该内容已删除",
 }
+
+
+# 表情在接口里是文字代码（[笑哭R]），在页面上被渲染成 <img>，
+# 于是同一条评论两边取到的文本不一样。比对前统一剥掉。
+_EMOJI_TAG = re.compile(r"\[[^\[\]]{1,12}\]")
+
+
+def _normalize_content(text: str) -> str:
+    return _EMOJI_TAG.sub("", text).strip()
 
 
 class NotLoggedIn(Exception):
@@ -57,20 +74,40 @@ class ReplyTargetGone(Exception):
 
 
 @dataclass
+class NoteContent:
+    """一篇笔记的文字内容"""
+    note_id: str
+    title: str = ""
+    body: str = ""
+    tags: list[str] = field(default_factory=list)
+    note_type: str = ""
+
+    @property
+    def is_empty(self) -> bool:
+        return not (self.title.strip() or self.body.strip())
+
+
+@dataclass
 class RawComment:
     author: str
     content: str
     note_image_url: str
     raw_time: str
     msg_type: str = "comment"
+    # 以下几项来自 mentions 接口，DOM 里没有。拿不到时为空字符串。
+    note_id: str = ""
+    comment_id: str = ""
+    note_xsec_token: str = ""
+    note_title: str = ""
 
     @property
     def fingerprint(self) -> str:
         """
         去重指纹。
 
-        小红书通知页不暴露稳定的评论 ID，因此用「类型+作者+内容+封面图」哈希。
-        同一人在同一篇笔记下发相同内容视为同一条，这是可接受的近似。
+        用「类型+作者+内容+封面图」哈希。虽然现在能从 mentions 接口拿到真实的
+        comment_id，但指纹算法刻意不改 —— 换算法会让库里所有历史评论的指纹失配，
+        被当成新评论重复回复一遍。comment_id 另存一列备用。
         """
         img_key = self.note_image_url.split("/")[-1].split("?")[0][:24]
         raw = f"{self.msg_type}|{self.author}|{self.content}|{img_key}"
@@ -85,6 +122,11 @@ class BrowserSession:
         self._pw = None
         self.context: BrowserContext | None = None
         self.page: Page | None = None
+        # 最近一次通知页请求解析出的元数据。列表保持接口原始顺序（与页面渲染
+        # 顺序一致，用于按位置配对），字典按「作者+规范化内容」索引作为兜底。
+        self._mentions_list: list[dict] = []
+        self._mentions_index: dict[tuple[str, str], dict] = {}
+        self._mentions_tasks: set[asyncio.Task] = set()
 
     @property
     def is_open(self) -> bool:
@@ -113,7 +155,75 @@ class BrowserSession:
         )
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
         self.page.set_default_timeout(30000)
+        self.page.on("response", self._on_response)
         logger.info(f"浏览器已启动（headless={self.headless}）")
+
+    # ==================== mentions 接口拦截 ====================
+
+    def _on_response(self, response) -> None:
+        """
+        response 事件回调必须是同步的，而读取响应体要 await，所以另起任务。
+        任务句柄要留着强引用，否则可能在读完之前被 GC 掉。
+        """
+        if MENTIONS_API not in response.url:
+            return
+        task = asyncio.create_task(self._absorb_mentions(response))
+        self._mentions_tasks.add(task)
+        task.add_done_callback(self._mentions_tasks.discard)
+
+    async def _absorb_mentions(self, response) -> None:
+        try:
+            data = await response.json()
+        except Exception as e:
+            logger.debug(f"mentions 响应解析失败: {e}")
+            return
+
+        rows: list[dict] = []
+        for msg in (data.get("data") or {}).get("message_list") or []:
+            comment = msg.get("comment_info") or {}
+            item = msg.get("item_info") or {}
+            user = msg.get("user_info") or {}
+            author = (user.get("nickname") or "").strip()
+            content = (comment.get("content") or "").strip()
+            rows.append({
+                "author": author,
+                "content": content,
+                "note_id": item.get("id") or "",
+                "note_xsec_token": item.get("xsec_token") or "",
+                "comment_id": comment.get("id") or "",
+                # 接口顺带给了笔记标题（标题为空的笔记不带这个字段）。
+                # 零成本，抓详情页失败时用它兜底，好过完全没有上下文。
+                "note_title": (item.get("content") or "").strip(),
+            })
+
+        if not rows:
+            return
+
+        self._mentions_list = rows
+        self._mentions_index = {
+            (r["author"], _normalize_content(r["content"])): r
+            for r in rows
+            if r["author"] and r["content"]
+        }
+        logger.debug(f"从 mentions 接口解析到 {len(rows)} 条元数据")
+
+    def _match_meta(self, idx: int, author: str, content: str) -> dict:
+        """
+        把一个 DOM 条目对上 mentions 接口里的元数据。
+
+        优先按位置配对：两边顺序一致，而且这样完全绕开了表情文本差异。
+        位置对不上（接口分页、页面结构调整）时再退回内容匹配。
+        """
+        if idx < len(self._mentions_list):
+            row = self._mentions_list[idx]
+            if row["author"] == author:
+                return row
+        return self._mentions_index.get((author, _normalize_content(content)), {})
+
+    async def _drain_mentions_tasks(self) -> None:
+        """等待在飞的响应解析任务收尾，确保 collect 读到的是本轮数据"""
+        if self._mentions_tasks:
+            await asyncio.gather(*list(self._mentions_tasks), return_exceptions=True)
 
     async def close(self) -> None:
         if self.context:
@@ -181,6 +291,7 @@ class BrowserSession:
         except Exception:
             pass
         await asyncio.sleep(3)
+        await self._drain_mentions_tasks()
 
     async def collect(self, limit: int = 5) -> list[RawComment]:
         """采集通知页上的评论"""
@@ -200,10 +311,13 @@ class BrowserSession:
         logger.info(f"通知页发现 {len(items)} 条通知")
         out: list[RawComment] = []
         skipped = 0
+        unmatched = 0
 
         # 注意先过滤再计数：如果先按 limit 截断，开头连续几条删除残骸会把
         # 真正需要回复的评论全挤出这一轮。
-        for item in items:
+        # 用 enumerate 而不是只遍历可回复条目：位置配对要求索引与接口顺序对齐，
+        # 所以被跳过的条目也必须占掉它的索引位。
+        for idx, item in enumerate(items):
             if len(out) >= limit:
                 break
             try:
@@ -232,14 +346,78 @@ class BrowserSession:
                 img_el = await item.query_selector(".extra img.extra-image")
                 note_image_url = (await img_el.get_attribute("src") or "") if img_el else ""
 
-                out.append(RawComment(author, content, note_image_url, raw_time))
+                # 对上 mentions 接口的元数据，拿到 DOM 里根本没有的 note_id
+                meta = self._match_meta(idx, author, content)
+                if not meta.get("note_id"):
+                    unmatched += 1
+
+                out.append(RawComment(
+                    author=author,
+                    content=content,
+                    note_image_url=note_image_url,
+                    raw_time=raw_time,
+                    note_id=meta.get("note_id", ""),
+                    comment_id=meta.get("comment_id", ""),
+                    note_xsec_token=meta.get("note_xsec_token", ""),
+                    note_title=meta.get("note_title", ""),
+                ))
             except Exception as e:
                 logger.debug(f"解析通知条目失败: {e}")
                 continue
 
         if skipped:
             logger.info(f"跳过 {skipped} 条不可回复的通知（已删除评论等）")
+        if unmatched:
+            logger.warning(
+                f"{unmatched} 条评论未能对上 mentions 接口数据，这些评论拿不到笔记上下文"
+            )
         return out
+
+    async def fetch_note(self, note_id: str, xsec_token: str) -> NoteContent:
+        """
+        抓一篇笔记的文字内容。
+
+        走 __INITIAL_STATE__ 而不是 DOM：explore 页右侧有推荐笔记流，
+        .title 这类选择器会命中别人的笔记，而 noteDetailMap 是按 note_id 精确索引的。
+        """
+        if not self.page:
+            raise BrowserUnavailable("浏览器未启动")
+        if not note_id:
+            raise ValueError("note_id 为空")
+
+        url = NOTE_URL.format(note_id=note_id, token=xsec_token)
+        await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(random.uniform(2.0, 3.5))
+
+        data = await self.page.evaluate(
+            """(nid) => {
+                const map = window.__INITIAL_STATE__?.note?.noteDetailMap;
+                if (!map) return null;
+                const note = map[nid]?.note;
+                if (!note) return null;
+                return {
+                    title: note.title || '',
+                    body: note.desc || '',
+                    tags: (note.tagList || []).map(t => t.name).filter(Boolean),
+                    note_type: note.type || '',
+                };
+            }""",
+            note_id,
+        )
+
+        if not data:
+            # 笔记被删、设为私密，或页面结构变了
+            if not await self._looks_logged_in():
+                raise NotLoggedIn("抓取笔记时未检测到登录态")
+            raise ReplyTargetGone(f"读不到笔记 {note_id} 的内容，可能已删除或不可见")
+
+        return NoteContent(
+            note_id=note_id,
+            title=(data.get("title") or "").strip(),
+            body=(data.get("body") or "").strip(),
+            tags=data.get("tags") or [],
+            note_type=data.get("note_type") or "",
+        )
 
     async def _looks_logged_in(self) -> bool:
         assert self.page is not None

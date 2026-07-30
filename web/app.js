@@ -267,6 +267,26 @@ function buildItem(r) {
   const main = document.createElement('div');
   main.className = 'item-main';
 
+  // 先显示笔记内容再显示评论 —— 审核时得先知道这条评论是在什么话题下说的，
+  // 否则「约起来，我可以」这种评论根本判断不了回复对不对。
+  const noteText = [r.note_title, r.note_body].filter(Boolean).join(' — ');
+  if (noteText) {
+    const note = document.createElement('div');
+    note.className = 'note-context';
+    const label = document.createElement('span');
+    label.className = 'note-label';
+    label.textContent = '笔记';
+    const text = document.createElement('span');
+    text.textContent = noteText.length > 120 ? noteText.slice(0, 120) + '…' : noteText;
+    note.append(label, text);
+    main.appendChild(note);
+  } else if (r.note_id) {
+    const note = document.createElement('div');
+    note.className = 'note-context note-context-missing';
+    note.textContent = '这篇笔记没取到文字内容，回复是在没有上下文的情况下生成的';
+    main.appendChild(note);
+  }
+
   const quote = document.createElement('div');
   quote.className = 'quote';
   quote.textContent = r.content || '（无内容）';

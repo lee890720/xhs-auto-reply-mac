@@ -214,6 +214,19 @@ main { max-width: 1080px; margin: 0 auto; padding: 20px 24px 60px; }
 }
 .item-body { display: flex; gap: 12px; align-items: flex-start; }
 .item-main { flex: 1; min-width: 0; }
+/* 笔记上下文：审核时先看清评论是在哪篇笔记下说的。
+   刻意做得比评论本身轻，它是背景信息不是主体。 */
+.note-context {
+  display: flex; gap: 7px; align-items: baseline; margin-bottom: 7px;
+  font-size: 12px; color: var(--text-dim); line-height: 1.5;
+  word-break: break-word;
+}
+.note-label {
+  flex: none; padding: 1px 6px; border-radius: 4px;
+  background: var(--border); color: var(--text-dim);
+  font-size: 11px; letter-spacing: .3px;
+}
+.note-context-missing { color: var(--amber, #b45309); font-style: italic; }
 .quote {
   background: var(--bg); border-left: 2.5px solid var(--border-strong);
   padding: 9px 12px; border-radius: 0 7px 7px 0;
