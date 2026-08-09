@@ -127,6 +127,9 @@ class BrowserSession:
         self._mentions_list: list[dict] = []
         self._mentions_index: dict[tuple[str, str], dict] = {}
         self._mentions_tasks: set[asyncio.Task] = set()
+        # 本轮导航有没有收到过 mentions 接口的正常响应。
+        # 它是比 DOM 更可靠的登录判据：页面渲染慢时 DOM 是空的，但接口已经回了。
+        self._mentions_ok = False
 
     @property
     def is_open(self) -> bool:
@@ -177,6 +180,11 @@ class BrowserSession:
         except Exception as e:
             logger.debug(f"mentions 响应解析失败: {e}")
             return
+
+        # 未登录时这个接口不会给出 data，所以能拿到就说明登录态有效，
+        # 哪怕一条通知都没有。
+        if isinstance(data.get("data"), dict):
+            self._mentions_ok = True
 
         rows: list[dict] = []
         for msg in (data.get("data") or {}).get("message_list") or []:
@@ -272,6 +280,7 @@ class BrowserSession:
 
     async def _goto_notifications(self) -> None:
         assert self.page is not None
+        self._mentions_ok = False        # 只认本次导航收到的响应
         await self.page.goto(NOTIFICATION_URL, wait_until="domcontentloaded", timeout=30000)
 
         # 切到「评论和@」tab
@@ -289,7 +298,9 @@ class BrowserSession:
                 ".notification-page .container", timeout=15000
             )
         except Exception:
-            pass
+            # 别静默吞掉。冷启动（浏览器刚装好、profile 无缓存）时确实会超时，
+            # 而下游一旦把「DOM 是空的」当成掉登录，引擎就停摆了。
+            logger.warning("等待通知条目渲染超时，页面可能还在加载")
         await asyncio.sleep(3)
         await self._drain_mentions_tasks()
 
@@ -302,6 +313,11 @@ class BrowserSession:
 
         items = await self.page.query_selector_all(".notification-page .container")
         if not items:
+            # 接口正常回了就是登录着的，DOM 空只是没渲染完。这时候判掉登录会让
+            # 引擎停摆等人来扫码，而实际上什么事都没有——冷启动时真的发生过。
+            if self._mentions_ok:
+                logger.warning("通知页 DOM 尚未渲染出条目，但接口有响应，本轮跳过")
+                return []
             # 页面上一条通知都没有时，先确认不是登录掉了
             if not await self._looks_logged_in():
                 raise NotLoggedIn("通知页无内容且未检测到登录态")

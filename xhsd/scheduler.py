@@ -19,6 +19,11 @@ from .llm import LLMError
 
 MAX_SEND_ATTEMPTS = 3
 
+# 判定需要登录后，每隔这么多轮自己重新检测一次。
+# 无人值守时没人会去点「重新检测」，而这个判定本身可能只是页面加载慢造成的误判，
+# 不自动重试的话引擎会一直停在那里，且只有菜单栏上一个「!」提示。
+LOGIN_RECHECK_EVERY_TICKS = 5
+
 
 def _parse_hhmm(value: str, fallback: dtime) -> dtime:
     try:
@@ -52,6 +57,7 @@ class Engine:
         self.last_error = ""
         self.last_poll_at = ""
         self.need_login = False
+        self._login_wait_ticks = 0      # 处于待登录状态已经空转了几轮
 
     # ==================== 生命周期 ====================
 
@@ -85,6 +91,18 @@ class Engine:
         """让主循环提前醒来（审核通过后调用）"""
         self._wake.set()
 
+    def _mark_need_login(self, reason: str) -> None:
+        """
+        进入待登录状态。
+
+        集中在一处是因为还要重置自动重检的计数器，散落在四个 except 分支里
+        很容易漏掉一个，漏掉的那条路径就会让引擎永远停在待登录。
+        """
+        self.need_login = True
+        self.state = "need_login"
+        self.last_error = reason
+        self._login_wait_ticks = 0
+
     def snapshot(self) -> dict:
         cfg = settings_store.load()
         return {
@@ -109,8 +127,7 @@ class Engine:
         try:
             await self.browser.open()
             if not await self.browser.check_login():
-                self.need_login = True
-                self.state = "need_login"
+                self._mark_need_login("启动时未检测到登录态")
                 logger.error("小红书未登录，请在弹出的浏览器窗口中扫码登录后点击「重新检测」")
             else:
                 self.need_login = False
@@ -147,7 +164,13 @@ class Engine:
         cfg = settings_store.load()
 
         if self.need_login:
-            # 登录态失效时不做任何页面操作，等人工处理后调用 recheck_login()
+            # 不做采集和发送，但每隔几轮自己试一次登录态。
+            # 人工点「重新检测」依然有效，这里只是不指望一定有人在。
+            self._login_wait_ticks += 1
+            if self._login_wait_ticks >= LOGIN_RECHECK_EVERY_TICKS:
+                self._login_wait_ticks = 0
+                ok, msg = await self.recheck_login()
+                logger.info(f"自动重新检测登录态: {msg}")
             return
 
         if in_quiet_hours(cfg.reply):
@@ -167,9 +190,7 @@ class Engine:
         try:
             comments = await self.browser.collect(limit=cfg.reply.max_per_poll)
         except NotLoggedIn as e:
-            self.need_login = True
-            self.state = "need_login"
-            self.last_error = str(e)
+            self._mark_need_login(str(e))
             logger.error(f"登录态失效: {e}")
             return
 
@@ -224,9 +245,7 @@ class Engine:
             try:
                 note = await self.browser.fetch_note(note_id, token)
             except NotLoggedIn as e:
-                self.need_login = True
-                self.state = "need_login"
-                self.last_error = str(e)
+                self._mark_need_login(str(e))
                 logger.error(f"抓取笔记时登录态失效: {e}")
                 return
             except Exception as e:
@@ -381,8 +400,7 @@ class Engine:
                 await self.browser.send_reply(row["author"], row["content"], text)
                 db.update_reply_status(row["id"], db.STATUS_SENT, mark_sent=True, error="")
             except NotLoggedIn as e:
-                self.need_login = True
-                self.state = "need_login"
+                self._mark_need_login(str(e))
                 logger.error(f"发送时发现登录态失效: {e}")
                 return
             except ReplyTargetGone as e:
@@ -409,7 +427,7 @@ class Engine:
     # ==================== 登录 ====================
 
     async def recheck_login(self) -> tuple[bool, str]:
-        """人工扫码后调用，重新检测登录态"""
+        """重新检测登录态。人工点「重新检测」和主循环的自动重试都走这里"""
         if not self.browser.is_open:
             try:
                 await self.browser.open()
@@ -419,12 +437,16 @@ class Engine:
         async with self._lock:
             ok = await self.browser.check_login()
 
-        self.need_login = not ok
         if ok:
+            self.need_login = False
+            self._login_wait_ticks = 0
             self.state = "running" if self.running else "stopped"
             self.last_error = ""
             self.wake()
             return True, "登录态正常"
+        # 这里不能用 _mark_need_login：它会清零计数器，
+        # 自动重试每轮都调用一次，清零后就再也攒不满、退化成永不重试。
+        self.need_login = True
         self.state = "need_login"
         return False, "仍未检测到登录状态，请在浏览器窗口中完成扫码"
 
