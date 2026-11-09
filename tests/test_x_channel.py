@@ -36,6 +36,8 @@ class FakeX:
         self.requests: list[str] = []
         self.reply_status = 201
         self.mentions_status = 200
+        self.follow_status = 200
+        self.follow_detail = ""
 
     def add_user(self, uid, username):
         self.users[uid] = {"id": uid, "username": username, "name": username}
@@ -92,6 +94,11 @@ class FakeX:
 
         if path == f"/2/users/{ME['id']}/following" and request.method == "POST":
             target = json.loads(request.content)["target_user_id"]
+            if self.follow_status == 429:
+                return httpx.Response(429, json={"title": "Too Many Requests"},
+                                      headers={"x-rate-limit-reset": str(int(time.time()) + 900)})
+            if self.follow_status == 403:
+                return httpx.Response(403, json={"title": "Forbidden", "detail": self.follow_detail})
             self.followed.append(target)
             return httpx.Response(200, json={"data": {"following": True, "pending_follow": False}})
 
@@ -365,7 +372,7 @@ def test_xhs_and_x_queues_are_separate(engine, fake_x):
 
 # ==================== 关注者 ====================
 
-def test_followers_are_never_followed_automatically(engine, fake_x):
+def test_followers_need_manual_approval_by_default(engine, fake_x):
     fake_x.followers = [follower(f"u{i}", f"old{i}") for i in range(8)]
     tick(engine)                                           # 第一次只记分界线
     assert db.count_followers_by_status() == {db.FOLLOWER_BASELINE: 5}
@@ -489,3 +496,100 @@ def test_quiet_hours_do_not_spin(engine, fake_x):
     assert engine.state == "quiet"
     assert fake_x.requests == []                               # 静默时段不请求 X
     assert engine._seconds_until_next(settings_store.load()) >= 55
+
+
+
+# ==================== 自动回关（可选，默认关闭）====================
+
+def _baseline_then_new_followers(engine, fake_x, new):
+    fake_x.followers = [follower(f"u{i}", f"old{i}") for i in range(5)]
+    tick(engine)
+    fake_x.followers = new + fake_x.followers
+    tick(engine)
+
+
+def test_auto_follow_back_skips_flagged_and_respects_quota(engine, fake_x):
+    settings_store.save_section("x", {"auto_follow_back": True, "auto_follow_daily_limit": 2})
+    bot = follower("b1", "user84736251", image="https://x/default_profile_images/x.png",
+                   tweets=0, following=5000, followers=2, description="")
+    _baseline_then_new_followers(engine, fake_x, [
+        follower("n3", "third"), follower("n2", "second"), bot, follower("n1", "first"),
+    ])
+    # 从早到晚处理：first、second 用完 2 个名额，third 超额留给人，机器人号不自动
+    assert fake_x.followed == ["n1", "n2"]
+    assert db.get_follower("n1")["approved_by"] == "auto"
+    assert db.get_follower("n3")["status"] == db.FOLLOWER_PENDING
+    assert db.get_follower("b1")["status"] == db.FOLLOWER_PENDING
+    assert engine.snapshot()["auto_followed_today"] == 2
+
+
+def test_auto_follow_turns_itself_off_when_x_limits_following(engine, fake_x):
+    settings_store.save_section("x", {"auto_follow_back": True})
+    fake_x.follow_status = 403
+    fake_x.follow_detail = "You are unable to follow more people at this time."
+    _baseline_then_new_followers(engine, fake_x, [follower("n2", "second"), follower("n1", "first")])
+    assert settings_store.load().x.auto_follow_back is False
+    assert "自动回关已自动关闭" in engine.follow_notice
+    assert db.get_follower("n1")["status"] == db.FOLLOWER_FAILED
+    assert db.get_follower("n2")["status"] == db.FOLLOWER_APPROVED      # 暂停后不再继续尝试
+    assert engine._follow_paused_until > time.time() + 3600
+
+
+def test_follow_rate_limit_pauses_follows_only(engine, fake_x):
+    settings_store.save_section("x", {"auto_follow_back": True})
+    fake_x.follow_status = 429
+    fake_x.add_user("2001", "alice")
+    _baseline_then_new_followers(engine, fake_x, [follower("n1", "first")])
+    assert settings_store.load().x.auto_follow_back is False
+    assert engine.state == "running"                                    # @ 回复不受影响
+    fake_x.mentions = [mention("600", "2001", "@me_account 在吗")]
+    tick(engine)
+    assert "600" in replies_by_tweet()
+
+
+def test_auto_follow_waits_minutes_between_follows(engine, fake_x, monkeypatch):
+    """自动回关的间隔是几分钟，而且不能把主循环卡住"""
+    monkeypatch.setattr(x_engine_mod.random, "uniform", lambda a, b: a)
+    settings_store.save_section("x", {"auto_follow_back": True})
+    _baseline_then_new_followers(engine, fake_x, [follower("n2", "second"), follower("n1", "first")])
+    assert fake_x.followed == ["n1"]                                    # 第二个要等间隔
+    assert engine._next_follow_at - time.time() > 100
+    assert engine._seconds_until_next(settings_store.load()) <= 300
+
+
+def test_manual_follow_records_human(engine, fake_x):
+    from xhsd import api
+    _baseline_then_new_followers(engine, fake_x, [follower("n1", "first")])
+    with TestClient(api.app) as c:
+        assert c.post("/api/x/followers/n1/follow").status_code == 200
+    assert db.get_follower("n1")["approved_by"] == "human"
+
+
+def test_migration_adds_approved_by_to_existing_followers_table():
+    """本机已部署的库里 x_followers 没有 approved_by 列，升级后要自动补上"""
+    with db.connect() as conn:
+        conn.execute("DROP TABLE x_followers")
+        conn.execute("""CREATE TABLE x_followers (
+            user_id TEXT PRIMARY KEY, username TEXT NOT NULL DEFAULT '',
+            name TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '',
+            profile_image_url TEXT NOT NULL DEFAULT '', followers_count INTEGER NOT NULL DEFAULT 0,
+            following_count INTEGER NOT NULL DEFAULT 0, tweet_count INTEGER NOT NULL DEFAULT 0,
+            account_created_at TEXT NOT NULL DEFAULT '', protected INTEGER NOT NULL DEFAULT 0,
+            flags TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '',
+            attempts INTEGER NOT NULL DEFAULT 0, first_seen_at TEXT NOT NULL,
+            acted_at TEXT NOT NULL DEFAULT '')""")
+        conn.execute("INSERT INTO x_followers (user_id, status, first_seen_at) VALUES ('old', 'baseline', '2026-11-09')")
+    db.init_db()
+    assert db.get_follower("old")["approved_by"] == ""
+    assert db.count_auto_follows_today() == 0
+
+
+def test_auto_follow_uses_latest_setting_within_a_tick(engine, fake_x):
+    """一轮开头读到的配置是旧的（自动回关没开），中途打开后检查关注者时要按新配置走"""
+    fake_x.followers = [follower(f"u{i}", f"old{i}") for i in range(5)]
+    tick(engine)
+    stale = settings_store.load()
+    settings_store.save_section("x", {"auto_follow_back": True})
+    fake_x.followers = [follower("n1", "first")] + fake_x.followers
+    asyncio.run(engine._poll_followers(stale, engine.client(stale), ME["id"]))
+    assert db.get_follower("n1")["approved_by"] == "auto"

@@ -7,14 +7,19 @@ X（推特）引擎。
 每轮做四件事，前两件和小红书一样，后两件是 X 独有的：
   1. 拉取 @ 我的推文 → 生成草稿（审核模式进待审队列）
   2. 发送已批准的回复
-  3. 每隔一段时间检查新关注者，放进「待回关」列表
-  4. 执行人已经点过「回关」的那些关注
+  3. 每隔一段时间检查新关注者，放进「待回关」列表（开了自动回关则直接排队）
+  4. 按节奏执行排队中的回关
 
-合规边界写死在代码里，不做成开关（依据 X 开发者指南）：
+写死在代码里的边界（依据 X 开发者指南）：
   - 只回复 @ 了我的推文，没有任何关键词搜索
   - 每条推文最多回一次（数据库指纹去重），每人每天有上限
   - 没有勾选「已获得 X 批准」时不允许全自动回复
-  - 不会自动回关：新关注者只进列表，人点了「回关」才执行
+
+自动回关是用户明确要求、知晓风险后才加的可选项，默认关闭。指南把
+「自动回关所有关注者」列为批量/激进关注，所以开启后仍然：
+  - 跳过带疑似机器人标记的账号，留给人决定
+  - 每日自动回关有单独上限，两次自动回关之间间隔几分钟
+  - X 一拒绝关注（403 关注受限、429）就自动关掉开关并在控制台提示
 """
 import asyncio
 import random
@@ -37,6 +42,12 @@ MAX_SEND_ATTEMPTS = 3
 MAX_MENTION_PAGES = 3         # 一轮最多翻几页 @，再多说明积压太久，旧的直接放弃
 MAX_FOLLOWER_PAGES = 20       # 一轮最多翻几页关注者
 NO_CREDIT_PAUSE = 3600        # 额度用完后隔多久再试（秒）
+AUTO_FOLLOW_MIN_DELAY = 120   # 两次自动回关之间的最短间隔（秒）
+AUTO_FOLLOW_MAX_DELAY = 300
+FOLLOW_LIMIT_PAUSE = 6 * 3600 # X 说关注受限后，多久之内不再尝试关注任何人
+
+# 403 里出现这些词，说明是账号层面的关注受限，而不是某一个目标账号的问题
+_FOLLOW_LIMIT_HINTS = ("unable to follow", "limit", "locked", "restrict", "spam")
 STATE_KEY = "x_state"         # 运行时状态（自己的用户 ID、游标），不属于用户配置
 
 
@@ -92,6 +103,11 @@ class XEngine:
         self._paused_until = 0.0
         self._next_mentions_at = 0.0
         self._next_followers_at = 0.0
+        # 回关单独调度：自动回关间隔几分钟，不能在主循环里 sleep 那么久，
+        # 否则会挡住拉取 @ 和发送回复
+        self._next_follow_at = 0.0
+        self._follow_paused_until = 0.0
+        self.follow_notice = ""      # 回关被 X 限制时给人看的说明
 
     # ==================== 状态 ====================
 
@@ -140,6 +156,10 @@ class XEngine:
             "follow_queue": followers.get(db.FOLLOWER_APPROVED, 0),
             "followed_today": db.count_followed_today(),
             "follow_daily_limit": cfg.x.follow_daily_limit,
+            "auto_follow_back": cfg.x.auto_follow_back,
+            "auto_follow_daily_limit": cfg.x.auto_follow_daily_limit,
+            "auto_followed_today": db.count_auto_follows_today(),
+            "follow_notice": self.follow_notice,
         }
 
     # ==================== 生命周期 ====================
@@ -155,6 +175,9 @@ class XEngine:
         self._paused_until = 0.0
         self._next_mentions_at = 0.0
         self._next_followers_at = 0.0
+        self._next_follow_at = 0.0
+        self._follow_paused_until = 0.0
+        self.follow_notice = ""
         self._task = asyncio.create_task(self._run(), name="x-engine")
         return True, "X 引擎已启动"
 
@@ -235,6 +258,8 @@ class XEngine:
         due = [self._next_mentions_at]
         if cfg.x.followers_enabled:
             due.append(self._next_followers_at)
+        if db.count_followers_by_status().get(db.FOLLOWER_APPROVED):
+            due.append(max(self._next_follow_at, self._follow_paused_until))
         return max(5.0, min(due) - now)
 
     async def _sleep_interruptible(self, seconds: float) -> None:
@@ -515,6 +540,9 @@ class XEngine:
         依赖关注者接口「最近关注的排在最前」：从头往后看，碰到见过的人就停。
         这样平时每次只读几个人，按返回人数计费时成本很低。
         """
+        # 重新读一次配置：一轮里前面发回复要按间隔 sleep，开头读到的配置可能
+        # 已经过时（实测在这期间刚打开的自动回关没有生效）
+        cfg = settings_store.load()
         size = cfg.x.followers_page_size
         page = await client.followers(uid, max_results=size)
 
@@ -544,22 +572,45 @@ class XEngine:
         if not hit_known and page.next_token:
             logger.warning(f"新关注者太多，本轮只记录了最近 {len(new)} 个")
 
-        added = 0
+        auto = cfg.x.auto_follow_back
+        quota = cfg.x.auto_follow_daily_limit - db.count_auto_follows_today() if auto else 0
+        pending = queued = over_quota = 0
         for u in reversed(new):
+            flags = suspicious_flags(u)
+            approved_by = ""
             if "following" in u.connection_status:
                 status = db.FOLLOWER_FOLLOWED          # 本来就关注着，不用再处理
+            elif auto and not flags and quota > 0:
+                status, approved_by = db.FOLLOWER_APPROVED, "auto"
+                quota -= 1
             else:
                 status = db.FOLLOWER_PENDING
-            if db.insert_follower(u.id, status, flags=",".join(suspicious_flags(u)), **_profile(u)):
-                added += status == db.FOLLOWER_PENDING
-        if added:
-            logger.info(f"发现 {added} 个新关注者，等你在控制台决定是否回关")
+                over_quota += auto and not flags and quota <= 0
+            if db.insert_follower(u.id, status, flags=",".join(flags),
+                                  approved_by=approved_by, **_profile(u)):
+                pending += status == db.FOLLOWER_PENDING
+                queued += status == db.FOLLOWER_APPROVED
+        if queued:
+            logger.info(f"自动回关：{queued} 个新关注者已排队，按间隔依次关注")
+        if pending:
+            logger.info(f"发现 {pending} 个新关注者，等你在控制台决定是否回关"
+                        + (f"（其中 {over_quota} 个因自动回关今日已达上限）" if over_quota else ""))
 
     async def _drain_follow_queue(
         self, cfg: settings_store.AppConfig, client: XClient, uid: str
     ) -> None:
-        """执行人已经点了「回关」的关注。每个都是人逐个决定的，这里只负责按节奏执行"""
+        """
+        执行排队中的回关。
+
+        每关注一个就记下「下一次最早什么时候能再关注」然后返回，由主循环到点
+        再叫醒，不在这里长时间 sleep —— 自动回关的间隔是几分钟，sleep 会挡住
+        拉取 @ 和发送回复。
+        """
+        cfg = settings_store.load()       # 同上，避免用到这一轮开头的旧配置
         while self.running:
+            now = time.time()
+            if now < self._next_follow_at or now < self._follow_paused_until:
+                return
             done = db.count_followed_today()
             if done >= cfg.x.follow_daily_limit:
                 logger.warning(f"今日已回关 {done} 人，达到上限 {cfg.x.follow_daily_limit}，剩下的明天继续")
@@ -570,32 +621,59 @@ class XEngine:
                 return
 
             who = f"@{f['username']}" if f["username"] else f["user_id"]
+            is_auto = f.get("approved_by") == "auto"
             try:
                 result = await client.follow(uid, f["user_id"])
-            except (XForbidden, XNotFound) as e:
+            except XRateLimited as e:
+                # 只暂停回关，不影响拉取 @ 和发送回复
+                self._follow_paused_until = e.reset_at
+                self._follow_restricted(cfg, f"回关触发 X 频率限制（429），暂停到 "
+                                             f"{datetime.fromtimestamp(e.reset_at):%H:%M}")
+                return
+            except XForbidden as e:
+                db.bump_follow_attempts(f["user_id"])
+                db.update_follower_status(f["user_id"], db.FOLLOWER_FAILED, error=str(e), mark_acted=True)
+                if any(h in str(e).lower() for h in _FOLLOW_LIMIT_HINTS):
+                    self._follow_paused_until = time.time() + FOLLOW_LIMIT_PAUSE
+                    self._follow_restricted(cfg, f"X 限制了关注，6 小时内不再尝试：{e}")
+                    return
+                logger.warning(f"回关 {who} 失败: {e}")
+                continue
+            except XNotFound as e:
                 db.bump_follow_attempts(f["user_id"])
                 db.update_follower_status(f["user_id"], db.FOLLOWER_FAILED, error=str(e), mark_acted=True)
                 logger.warning(f"回关 {who} 失败: {e}")
                 continue
-            except (XAuthError, XPaymentRequired, XRateLimited):
+            except (XAuthError, XPaymentRequired):
                 raise
             except XAPIError as e:
                 db.bump_follow_attempts(f["user_id"])
                 if (f["attempts"] or 0) + 1 >= MAX_SEND_ATTEMPTS:
                     db.update_follower_status(f["user_id"], db.FOLLOWER_FAILED, error=str(e), mark_acted=True)
                     logger.error(f"回关 {who} 失败（已重试 {MAX_SEND_ATTEMPTS} 次）: {e}")
-                else:
-                    db.update_follower_status(f["user_id"], db.FOLLOWER_APPROVED, error=str(e))
-                    logger.warning(f"回关 {who} 失败，稍后重试: {e}")
-                    return
-                continue
+                    continue
+                db.update_follower_status(f["user_id"], db.FOLLOWER_APPROVED, error=str(e))
+                logger.warning(f"回关 {who} 失败，稍后重试: {e}")
+                self._next_follow_at = time.time() + 300
+                return
 
             db.bump_follow_attempts(f["user_id"])
             note = "对方是受保护账号，已发送关注请求，等对方同意" if result == "pending" else ""
             db.update_follower_status(f["user_id"], db.FOLLOWER_FOLLOWED, error=note, mark_acted=True)
-            logger.info(f"已回关 {who}")
+            logger.info(f"已{'自动' if is_auto else ''}回关 {who}")
 
-            await asyncio.sleep(random.uniform(cfg.x.follow_min_delay, cfg.x.follow_max_delay))
+            lo, hi = ((AUTO_FOLLOW_MIN_DELAY, AUTO_FOLLOW_MAX_DELAY) if is_auto
+                      else (cfg.x.follow_min_delay, cfg.x.follow_max_delay))
+            self._next_follow_at = time.time() + random.uniform(lo, hi)
+
+    def _follow_restricted(self, cfg: settings_store.AppConfig, reason: str) -> None:
+        """X 拒绝关注时：关掉自动回关，给控制台留一条说明"""
+        if cfg.x.auto_follow_back:
+            settings_store.save_section("x", {"auto_follow_back": False})
+            self.follow_notice = f"自动回关已自动关闭。{reason}"
+        else:
+            self.follow_notice = f"回关已暂停。{reason}"
+        logger.error(self.follow_notice)
 
 
 def _profile(u: XUser) -> dict:

@@ -177,6 +177,8 @@ async def update_config(section: str, body: SectionUpdate):
     except Exception as e:
         raise HTTPException(422, f"配置校验失败: {e}")
 
+    if section == "x" and values.get("auto_follow_back"):
+        x_engine.follow_notice = ""          # 人重新打开了自动回关，之前的受限提示作废
     wake_all()
     logger.info(f"配置已更新: {section}")
     return {"success": True, "config": settings_store.redact(settings_store.load())}
@@ -306,8 +308,7 @@ async def approve_all(platform: str | None = None):
 
 
 # ==================== X 关注者 ====================
-# 这里没有「全部回关」：X 开发者指南把自动回关归为批量/激进关注。
-# 每个回关都得是人对一个具体账号做的决定。
+# 这里没有「全部回关」按钮。可选的自动回关在引擎里实现，有单独的上限和受限自动停用。
 
 @app.get("/api/x/followers")
 async def get_x_followers(status: str | None = None, limit: int = 100, offset: int = 0):
@@ -324,7 +325,9 @@ async def follow_x_follower(user_id: str):
         raise HTTPException(404, "记录不存在")
     if f["status"] not in (db.FOLLOWER_PENDING, db.FOLLOWER_IGNORED, db.FOLLOWER_FAILED):
         raise HTTPException(400, "这个人已经回关过或正在排队")
-    db.update_follower_status(user_id, db.FOLLOWER_APPROVED, error="", mark_acted=True)
+    db.update_follower_status(
+        user_id, db.FOLLOWER_APPROVED, error="", mark_acted=True, approved_by="human"
+    )
     x_engine.wake()
     if not x_engine.running:
         return {"success": True, "message": "已加入回关队列。X 引擎没有运行，启动后才会执行"}

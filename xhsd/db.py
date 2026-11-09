@@ -75,9 +75,9 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);
 
--- X 的关注者。只用来发现「新关注者」并让人逐个决定要不要回关。
--- X 开发者指南明确禁止自动回关，所以这里没有任何自动关注的路径：
--- 状态只有人点了「回关」才会变成 approved，引擎只执行 approved 的。
+-- X 的关注者。用来发现「新关注者」，默认由人逐个决定要不要回关。
+-- 可选的自动回关（违反 X 开发者指南，默认关闭）会把没有可疑标记的新关注者
+-- 直接置为 approved，approved_by 记为 auto，以便单独计算自动回关的上限。
 CREATE TABLE IF NOT EXISTS x_followers (
     user_id            TEXT PRIMARY KEY,
     username           TEXT    NOT NULL DEFAULT '',
@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS x_followers (
     protected          INTEGER NOT NULL DEFAULT 0,
     flags              TEXT    NOT NULL DEFAULT '',   -- 疑似机器人特征，逗号分隔
     status             TEXT    NOT NULL,
+    approved_by        TEXT    NOT NULL DEFAULT '',   -- human | auto
     error              TEXT    NOT NULL DEFAULT '',
     attempts           INTEGER NOT NULL DEFAULT 0,
     first_seen_at      TEXT    NOT NULL,
@@ -107,7 +108,7 @@ PLATFORM_X = "x"
 # X 关注者状态
 FOLLOWER_BASELINE = "baseline"   # 首次启动时已经在的老关注者，不进待处理列表
 FOLLOWER_PENDING = "pending"     # 新关注者，等人决定
-FOLLOWER_APPROVED = "approved"   # 人点了「回关」，等引擎执行
+FOLLOWER_APPROVED = "approved"   # 人点了「回关」或自动回关选中了它，等引擎执行
 FOLLOWER_FOLLOWED = "followed"   # 已回关（或本来就关注着）
 FOLLOWER_IGNORED = "ignored"     # 人选择不回关
 FOLLOWER_FAILED = "failed"       # 回关失败
@@ -159,6 +160,11 @@ _MESSAGE_COLUMNS = {
     "author_id": "TEXT NOT NULL DEFAULT ''",
 }
 
+# 后续版本新增的 x_followers 列
+_FOLLOWER_COLUMNS = {
+    "approved_by": "TEXT NOT NULL DEFAULT ''",
+}
+
 
 def init_db() -> None:
     """建表。幂等，每次启动都会调用"""
@@ -168,6 +174,10 @@ def init_db() -> None:
         for col, decl in _MESSAGE_COLUMNS.items():
             if col not in existing:
                 conn.execute(f"ALTER TABLE messages ADD COLUMN {col} {decl}")
+        existing = {r["name"] for r in conn.execute("PRAGMA table_info(x_followers)")}
+        for col, decl in _FOLLOWER_COLUMNS.items():
+            if col not in existing:
+                conn.execute(f"ALTER TABLE x_followers ADD COLUMN {col} {decl}")
 
 
 def query(sql: str, params: tuple = ()) -> list[dict[str, Any]]:
@@ -454,21 +464,23 @@ def insert_follower(
     account_created_at: str = "",
     protected: bool = False,
     flags: str = "",
+    approved_by: str = "",
 ) -> bool:
     """插入一个关注者。已存在返回 False，不覆盖人已经做过的决定"""
+    acted = status in (FOLLOWER_FOLLOWED, FOLLOWER_APPROVED)
     with connect() as conn:
         try:
             conn.execute(
                 """INSERT INTO x_followers
                    (user_id, username, name, description, profile_image_url,
                     followers_count, following_count, tweet_count,
-                    account_created_at, protected, flags, status, first_seen_at,
-                    acted_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    account_created_at, protected, flags, status, approved_by,
+                    first_seen_at, acted_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (user_id, username, name, description, profile_image_url,
                  followers_count, following_count, tweet_count,
-                 account_created_at, int(protected), flags, status, now(),
-                 now() if status == FOLLOWER_FOLLOWED else ""),
+                 account_created_at, int(protected), flags, status, approved_by,
+                 now(), now() if acted else ""),
             )
             return True
         except sqlite3.IntegrityError:
@@ -503,9 +515,13 @@ def update_follower_status(
     status: str,
     error: str | None = None,
     mark_acted: bool = False,
+    approved_by: str | None = None,
 ) -> None:
     fields = ["status = ?"]
     params: list[Any] = [status]
+    if approved_by is not None:
+        fields.append("approved_by = ?")
+        params.append(approved_by)
     if error is not None:
         fields.append("error = ?")
         params.append(error)
@@ -534,6 +550,20 @@ def count_followed_today() -> int:
     return scalar(
         "SELECT COUNT(*) FROM x_followers WHERE status = ? AND acted_at LIKE ? AND attempts > 0",
         (FOLLOWER_FOLLOWED, f"{today}%"),
+    ) or 0
+
+
+def count_auto_follows_today() -> int:
+    """
+    今天被自动回关选中的人数（不论最后成没成功），用于自动回关的每日上限。
+
+    按「选中」而不是「成功」计数：发现新关注者时就要决定还能自动选几个，
+    超出的留给人处理，而不是排成一条长队拖到明天再自动执行。
+    """
+    today = datetime.now().date().isoformat()
+    return scalar(
+        "SELECT COUNT(*) FROM x_followers WHERE approved_by = 'auto' AND first_seen_at LIKE ?",
+        (f"{today}%",),
     ) or 0
 
 

@@ -137,8 +137,8 @@
 <!-- ============ X 新关注者 ============ -->
 <!-- 刻意没有「全部回关」：X 开发者指南把自动回关归为批量/激进关注 -->
 <section class="panel" id="panel-followers">
-  <div class="notice">
-    X 不允许自动回关。这里只列出新关注你的人，回不回关由你逐个决定；点了「回关」的会按设置里的间隔依次执行，并受每日上限约束。
+  <div class="notice" id="followers-notice">
+    这里列出新关注你的人，回不回关由你逐个决定；点了「回关」的会按设置里的间隔依次执行，并受每日上限约束。
   </div>
   <div class="filter-bar">
     <div class="filters" id="follower-filters"></div>
@@ -329,7 +329,7 @@
     <div class="section-head">
       <div>
         <h2>X 新关注者</h2>
-        <p>定时检查新关注你的人，放进「X 新关注者」页由你逐个决定是否回关。系统不会自动回关任何人。</p>
+        <p>定时检查新关注你的人。默认放进「X 新关注者」页由你逐个决定；打开下面的自动回关后，没有可疑标记的会被自动回关。</p>
       </div>
     </div>
     <div class="form">
@@ -360,6 +360,22 @@
         <label class="field">
           <span class="field-label">回关间隔上限（秒）</span>
           <input type="number" id="x-follow_max_delay" min="1">
+        </label>
+      </div>
+      <label class="check">
+        <input type="checkbox" id="x-auto_follow_back" onchange="confirmAutoFollow(this)">
+        <span>自动回关新关注者</span>
+      </label>
+      <div class="risk">
+        X 开发者指南把「自动回关所有关注者」列为批量/激进关注，打开后有被限制关注、App 被停用乃至封号的风险。
+        开启后仍有这些限制：带疑似机器人标记的不会自动回关（留在列表里由你决定）；每日自动回关有单独上限；
+        两次自动回关之间间隔 2–5 分钟；X 一拒绝关注（关注受限或频率限制），自动回关会被自动关闭并在顶部提示。
+      </div>
+      <div class="field-row">
+        <label class="field">
+          <span class="field-label">每日自动回关上限</span>
+          <input type="number" id="x-auto_follow_daily_limit" min="1" max="100">
+          <span class="field-hint">超出的新关注者留在列表里，由你决定</span>
         </label>
       </div>
       <div class="form-actions">

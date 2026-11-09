@@ -346,6 +346,15 @@ input:focus, select:focus, textarea:focus {
 .char-count { font-size: 11.5px; color: var(--text-faint); margin-top: 4px; text-align: right; }
 .char-count.over { color: var(--red); font-weight: 600; }
 
+.risk {
+  font-size: 12px; line-height: 1.65; color: #9a3412;
+  background: #fff7ed; border: 1px solid #fed7aa; border-radius: 8px; padding: 9px 12px;
+}
+@media (prefers-color-scheme: dark) {
+  .risk { color: #fdba74; background: #2a1708; border-color: #5a3010; }
+}
+.notice.notice-warn { border-left-color: var(--amber); }
+
 .notice {
   font-size: 12.5px; color: var(--text-dim); line-height: 1.65;
   background: var(--surface); border: 1px solid var(--border);

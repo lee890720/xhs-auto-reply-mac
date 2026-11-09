@@ -201,13 +201,19 @@ class XConfig(BaseModel):
     quiet_start: str = "23:00"
     quiet_end: str = "08:00"
 
-    # ---------- 关注者（只发现，不自动回关）----------
+    # ---------- 关注者 ----------
     followers_enabled: bool = True
     followers_poll_interval: int = Field(7200, ge=900)   # 检查新关注者的间隔（秒）
     followers_page_size: int = Field(5, ge=1, le=100)    # 每次取几个，按返回人数计费
     follow_daily_limit: int = Field(50, ge=1, le=400)    # 每日执行回关的上限
     follow_min_delay: float = Field(20.0, ge=1)
     follow_max_delay: float = Field(90.0, ge=1)
+    # 自动回关。X 开发者指南把「自动回关所有关注者」列为批量/激进关注，
+    # 打开有被限制关注、App 被停用乃至封号的风险，所以默认关闭。
+    # 即使打开，带疑似机器人标记的新关注者也不会被自动回关；
+    # X 一旦拒绝关注（403 限制或 429），这个开关会被自动关掉。
+    auto_follow_back: bool = False
+    auto_follow_daily_limit: int = Field(20, ge=1, le=100)
 
     system_prompt: str = DEFAULT_X_PERSONA
 

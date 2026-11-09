@@ -143,12 +143,16 @@ function renderStatus(s) {
   $('login-banner').hidden = !s.need_login;
   $('setup-banner').hidden = s.llm_configured;
   const xNeedsHuman = x.state === 'auth_error' || x.state === 'no_credit';
-  $('x-banner').hidden = !xNeedsHuman;
+  $('x-banner').hidden = !xNeedsHuman && !x.follow_notice;
   if (xNeedsHuman) {
     $('x-banner-title').textContent =
       x.state === 'auth_error' ? 'X 认证失败，引擎已停止' : 'X API 额度用完，已暂停';
     $('x-banner-text').textContent = x.last_error || '';
+  } else if (x.follow_notice) {
+    $('x-banner-title').textContent = 'X 回关受限';
+    $('x-banner-text').textContent = x.follow_notice;
   }
+  renderFollowersNotice(x);
 
   const badge = $('badge-pending');
   badge.textContent = s.pending_review_total;
@@ -512,6 +516,19 @@ async function approveAll() {
 // ============ X 新关注者 ============
 // 每个回关都必须是人对一个具体账号点的按钮，这里刻意没有批量操作。
 
+function renderFollowersNotice(x) {
+  const el = $('followers-notice');
+  if (x.auto_follow_back) {
+    el.className = 'notice notice-warn';
+    el.textContent = `自动回关已开启（违反 X 开发者指南，有风险）：没有疑似机器人标记的新关注者会被自动回关，`
+      + `今日已自动回关 ${x.auto_followed_today || 0}/${x.auto_follow_daily_limit}，两次之间间隔 2–5 分钟。`
+      + `带标记的和超出上限的留在下面「待处理」里由你决定。`;
+  } else {
+    el.className = 'notice';
+    el.textContent = '这里列出新关注你的人，回不回关由你逐个决定；点了「回关」的会按设置里的间隔依次执行，并受每日上限约束。';
+  }
+}
+
 function renderFollowerFilters(counts) {
   const bar = $('follower-filters');
   bar.textContent = '';
@@ -560,6 +577,12 @@ function buildFollower(f) {
   meta.textContent = '发现于 ' + (f.first_seen_at || '').replace('T', ' ').slice(0, 16)
     + (f.status === 'approved' ? ' · 排队中，按间隔依次执行' : '');
   head.append(name, handle, tag);
+  if (f.approved_by === 'auto') {
+    const auto = document.createElement('span');
+    auto.className = 'tag tag-approved';
+    auto.textContent = '自动回关';
+    head.appendChild(auto);
+  }
   if (f.protected) {
     const lock = document.createElement('span');
     lock.className = 'tag tag-rejected';
@@ -717,6 +740,16 @@ function fillForm(cfg) {
   $('x-ai_reply_approved').checked = x.ai_reply_approved;
   $('x-quiet_enabled').checked = x.quiet_enabled;
   $('x-followers_enabled').checked = x.followers_enabled;
+  $('x-auto_follow_back').checked = x.auto_follow_back;
+  set('x-auto_follow_daily_limit', x.auto_follow_daily_limit);
+}
+
+// 打开自动回关前再确认一次风险。只影响勾选框，真正生效要点「保存」
+function confirmAutoFollow(box) {
+  if (box.checked && !confirm(
+    '自动回关违反 X 开发者指南，可能导致关注功能被限制、App 被停用乃至封号。\n\n确定要开启吗？（开启后还需点「保存」）')) {
+    box.checked = false;
+  }
 }
 
 function onProviderChange() {
@@ -804,6 +837,8 @@ function collectSection(name) {
     follow_daily_limit: int('x-follow_daily_limit'),
     follow_min_delay: num('x-follow_min_delay'),
     follow_max_delay: num('x-follow_max_delay'),
+    auto_follow_back: $('x-auto_follow_back').checked,
+    auto_follow_daily_limit: int('x-auto_follow_daily_limit'),
   };
   if (name === 'x-persona') return { system_prompt: $('x-system_prompt').value };
   if (name === 'safety') return {
