@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>小红书自动回复 · 控制台</title>
+<title>小红书 / X 自动回复 · 控制台</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -12,17 +12,29 @@
   <div class="brand">
     <span class="logo">书</span>
     <div>
-      <div class="brand-title">小红书自动回复</div>
+      <div class="brand-title">小红书 / X 自动回复</div>
       <div class="brand-sub">本地控制台</div>
     </div>
   </div>
 
+  <!-- 两个平台各自启停，互不影响 -->
   <div class="topbar-right">
-    <div class="status-chip" id="status-chip">
-      <span class="dot" id="status-dot"></span>
-      <span id="status-text">连接中…</span>
+    <div class="engine">
+      <div class="status-chip">
+        <span class="dot" id="xhs-dot"></span>
+        <span class="chip-name">小红书</span>
+        <span id="xhs-text">连接中…</span>
+      </div>
+      <button class="btn btn-sm" id="xhs-toggle" onclick="toggleEngine('xhs')">启动</button>
     </div>
-    <button class="btn btn-primary" id="btn-toggle" onclick="toggleEngine()">启动</button>
+    <div class="engine">
+      <div class="status-chip">
+        <span class="dot" id="x-dot"></span>
+        <span class="chip-name">X</span>
+        <span id="x-text">连接中…</span>
+      </div>
+      <button class="btn btn-sm" id="x-toggle" onclick="toggleEngine('x')">启动</button>
+    </div>
   </div>
 </header>
 
@@ -49,10 +61,24 @@
   </div>
 </div>
 
+<!-- X 需要人处理的状态：密钥失效、额度用完 -->
+<div class="banner banner-warn" id="x-banner" hidden>
+  <div>
+    <strong id="x-banner-title">X 引擎已停止</strong>
+    <span id="x-banner-text"></span>
+  </div>
+  <div class="banner-actions">
+    <button class="btn btn-sm btn-primary" onclick="switchTab('settings')">去设置</button>
+  </div>
+</div>
+
 <nav class="tabs">
   <button class="tab active" data-tab="overview" onclick="switchTab('overview')">概览</button>
   <button class="tab" data-tab="review" onclick="switchTab('review')">
     审核队列 <span class="badge" id="badge-pending" hidden>0</span>
+  </button>
+  <button class="tab" data-tab="followers" onclick="switchTab('followers')">
+    X 新关注者 <span class="badge" id="badge-followers" hidden>0</span>
   </button>
   <button class="tab" data-tab="settings" onclick="switchTab('settings')">设置</button>
   <button class="tab" data-tab="logs" onclick="switchTab('logs')">日志</button>
@@ -99,10 +125,26 @@
 <!-- ============ 审核队列 ============ -->
 <section class="panel" id="panel-review">
   <div class="filter-bar">
+    <div class="filters" id="platform-filters"></div>
+  </div>
+  <div class="filter-bar">
     <div class="filters" id="filters"></div>
     <button class="btn btn-sm btn-primary" id="btn-approve-all" onclick="approveAll()">全部批准</button>
   </div>
   <div class="queue" id="queue"></div>
+</section>
+
+<!-- ============ X 新关注者 ============ -->
+<!-- 刻意没有「全部回关」：X 开发者指南把自动回关归为批量/激进关注 -->
+<section class="panel" id="panel-followers">
+  <div class="notice">
+    X 不允许自动回关。这里只列出新关注你的人，回不回关由你逐个决定；点了「回关」的会按设置里的间隔依次执行，并受每日上限约束。
+  </div>
+  <div class="filter-bar">
+    <div class="filters" id="follower-filters"></div>
+    <button class="btn btn-sm" onclick="checkFollowers()">立即检查</button>
+  </div>
+  <div class="queue" id="followers"></div>
 </section>
 
 <!-- ============ 设置 ============ -->
@@ -111,7 +153,7 @@
   <div class="section">
     <div class="section-head">
       <h2>模型 API</h2>
-      <p>回复由这里配置的大模型生成。所有服务商都使用 OpenAI 兼容接口。</p>
+      <p>回复由这里配置的大模型生成，小红书和 X 共用。所有服务商都使用 OpenAI 兼容接口。</p>
     </div>
     <div class="form">
       <label class="field">
@@ -161,9 +203,195 @@
     </div>
   </div>
 
+  <!-- ============ X ============ -->
   <div class="section">
     <div class="section-head">
-      <h2>回复人设</h2>
+      <div>
+        <h2>X 账号</h2>
+        <p>用 X 官方 API。在开发者后台把 App 权限设为 <b>Read and Write</b>，<b>改完权限再</b>生成 Access Token（之前生成的令牌仍是只读的）。</p>
+      </div>
+    </div>
+    <div class="form">
+      <div class="field-row">
+        <label class="field">
+          <span class="field-label">API Key</span>
+          <input type="password" id="x-api_key" autocomplete="off" placeholder="Consumer Key">
+        </label>
+        <label class="field">
+          <span class="field-label">API Key Secret</span>
+          <input type="password" id="x-api_secret" autocomplete="off">
+        </label>
+      </div>
+      <div class="field-row">
+        <label class="field">
+          <span class="field-label">Access Token</span>
+          <input type="password" id="x-access_token" autocomplete="off">
+        </label>
+        <label class="field">
+          <span class="field-label">Access Token Secret</span>
+          <input type="password" id="x-access_token_secret" autocomplete="off">
+        </label>
+      </div>
+      <span class="field-hint">
+        四个值都在开发者后台 → 你的 App → Keys and tokens。只保存在本机数据库。
+        <a href="https://developer.x.com/en/portal/dashboard" target="_blank" rel="noopener">打开开发者后台 →</a>
+      </span>
+      <div class="form-actions">
+        <button class="btn btn-primary" onclick="saveSection('x-account')">保存</button>
+        <button class="btn" onclick="testX()">测试连接</button>
+        <span class="form-msg" id="msg-x-account"></span>
+      </div>
+      <span class="field-hint">「测试连接」只能验证密钥能读；有没有写权限，要等第一次真正发送才知道。</span>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-head">
+      <div>
+        <h2>X 回复策略</h2>
+        <p>只回复 @ 了你的推文（包括回复你推文的人），每条最多回一次。没有关键词搜索 —— 那是 X 明确禁止的。</p>
+      </div>
+    </div>
+    <div class="form">
+      <label class="field">
+        <span class="field-label">运行模式</span>
+        <select id="x-mode">
+          <option value="review">审核模式 — 生成草稿，人工放行后才发送</option>
+          <option value="auto">全自动 — 生成后直接发送（需要先获得 X 批准）</option>
+        </select>
+      </label>
+      <label class="check">
+        <input type="checkbox" id="x-ai_reply_approved">
+        <span>已获得 X 对 AI 生成回复的书面批准</span>
+      </label>
+      <span class="field-hint">
+        X 开发者指南规定，用 AI 生成并自动发布回复，必须事先通过 X 的 Policy Support 表单申请批准；
+        没勾选这一项就不能切到全自动。全自动运行的账号还要在资料页开启「Automated」标签、简介里写明是机器人以及谁在运营。
+        <a href="https://help.x.com/forms/platform" target="_blank" rel="noopener">申请表单 →</a>
+      </span>
+
+      <div class="field-row">
+        <label class="field">
+          <span class="field-label">拉取 @ 的间隔（秒）</span>
+          <input type="number" id="x-poll_interval" min="60">
+        </label>
+        <label class="field">
+          <span class="field-label">每日回复上限</span>
+          <input type="number" id="x-daily_limit" min="1">
+        </label>
+        <label class="field">
+          <span class="field-label">每人每日上限</span>
+          <input type="number" id="x-per_user_daily_limit" min="1">
+        </label>
+      </div>
+      <div class="field-row">
+        <label class="field">
+          <span class="field-label">单次拉取条数</span>
+          <input type="number" id="x-max_per_poll" min="5" max="100">
+        </label>
+        <label class="field">
+          <span class="field-label">@ 人数超过多少算群发</span>
+          <input type="number" id="x-max_mentions_in_tweet" min="1">
+        </label>
+      </div>
+      <div class="field-row">
+        <label class="field">
+          <span class="field-label">回复间隔下限（秒）</span>
+          <input type="number" id="x-min_delay" min="1">
+        </label>
+        <label class="field">
+          <span class="field-label">回复间隔上限（秒）</span>
+          <input type="number" id="x-max_delay" min="1">
+        </label>
+      </div>
+      <label class="check">
+        <input type="checkbox" id="x-quiet_enabled">
+        <span>启用夜间静默（该时段不拉取、不发送、不回关）</span>
+      </label>
+      <div class="field-row">
+        <label class="field">
+          <span class="field-label">静默开始</span>
+          <input type="text" id="x-quiet_start" placeholder="23:00">
+        </label>
+        <label class="field">
+          <span class="field-label">静默结束</span>
+          <input type="text" id="x-quiet_end" placeholder="08:00">
+        </label>
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-primary" onclick="saveSection('x-reply')">保存</button>
+        <span class="form-msg" id="msg-x-reply"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-head">
+      <div>
+        <h2>X 新关注者</h2>
+        <p>定时检查新关注你的人，放进「X 新关注者」页由你逐个决定是否回关。系统不会自动回关任何人。</p>
+      </div>
+    </div>
+    <div class="form">
+      <label class="check">
+        <input type="checkbox" id="x-followers_enabled">
+        <span>检查新关注者</span>
+      </label>
+      <div class="field-row">
+        <label class="field">
+          <span class="field-label">检查间隔（秒）</span>
+          <input type="number" id="x-followers_poll_interval" min="900">
+        </label>
+        <label class="field">
+          <span class="field-label">每次读取人数</span>
+          <input type="number" id="x-followers_page_size" min="1" max="100">
+          <span class="field-hint">按返回人数计费。全是新人才会继续往后翻</span>
+        </label>
+        <label class="field">
+          <span class="field-label">每日回关上限</span>
+          <input type="number" id="x-follow_daily_limit" min="1" max="400">
+        </label>
+      </div>
+      <div class="field-row">
+        <label class="field">
+          <span class="field-label">回关间隔下限（秒）</span>
+          <input type="number" id="x-follow_min_delay" min="1">
+        </label>
+        <label class="field">
+          <span class="field-label">回关间隔上限（秒）</span>
+          <input type="number" id="x-follow_max_delay" min="1">
+        </label>
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-primary" onclick="saveSection('x-followers')">保存</button>
+        <span class="form-msg" id="msg-x-followers"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-head">
+      <div>
+        <h2>X 回复人设</h2>
+        <p>和小红书分开。默认按对方的语言回复，不带 @、话题标签和链接；被问是不是机器人一律转人工，不冒充真人。</p>
+      </div>
+    </div>
+    <div class="form">
+      <label class="field">
+        <span class="field-label">System Prompt</span>
+        <textarea id="x-system_prompt" rows="16"></textarea>
+      </label>
+      <div class="form-actions">
+        <button class="btn btn-primary" onclick="saveSection('x-persona')">保存</button>
+        <span class="form-msg" id="msg-x-persona"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 小红书 ============ -->
+  <div class="section">
+    <div class="section-head">
+      <h2>小红书回复人设</h2>
       <p>这段提示词决定回复的语气和边界，改完立即生效，不需要重启。</p>
     </div>
     <div class="form">
@@ -180,7 +408,7 @@
 
   <div class="section">
     <div class="section-head">
-      <h2>回复策略</h2>
+      <h2>小红书回复策略</h2>
       <p>控制发送节奏与频率，直接关系到账号安全。</p>
     </div>
     <div class="form">
@@ -244,7 +472,7 @@
   <div class="section">
     <div class="section-head">
       <h2>安全策略</h2>
-      <p>命中敏感词的评论不会走模型，避免在敏感话题上自动发言。</p>
+      <p>小红书和 X 共用。命中敏感词的评论不会走模型，避免在敏感话题上自动发言。</p>
     </div>
     <div class="form">
       <label class="field">
@@ -281,9 +509,14 @@
     <div class="section-head"><h2>系统</h2></div>
     <div class="form">
       <label class="check">
-        <input type="checkbox" id="autostart" onchange="saveAutostart()">
-        <span>守护进程启动时自动开始监控</span>
+        <input type="checkbox" id="autostart" onchange="saveAutostart('xhs')">
+        <span>守护进程启动时自动开始小红书监控（会打开浏览器）</span>
       </label>
+      <label class="check">
+        <input type="checkbox" id="x-autostart" onchange="saveAutostart('x')">
+        <span>守护进程启动时自动开始 X 监控</span>
+      </label>
+      <span class="field-hint">两个平台默认都不自动运行，各自独立。</span>
       <div class="form-actions">
         <button class="btn btn-danger-ghost" onclick="cleanup()">清理 90 天前的历史数据</button>
         <span class="form-msg" id="msg-system"></span>

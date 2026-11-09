@@ -7,7 +7,7 @@
 import os
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from . import db
 
@@ -130,11 +130,112 @@ class PersonaConfig(BaseModel):
     system_prompt: str = DEFAULT_PERSONA
 
 
+# X 的人设跟小红书分开：平台的说话习惯不一样（X 上要按对方的语言回复、
+# 不能带 @ 和话题标签），而且 X 的开发者指南要求自动化账号不得冒充真人，
+# 所以这里不再写「不要自称 AI」，被问到是不是机器人一律转人工。
+DEFAULT_X_PERSONA = """你是这个 X（推特）账号的运营者，在回复 @ 了你、或者回复了你推文的人。
+
+怎么写：
+- 用对方的语言回复。对方写中文就用中文，写英文就用英文，其他语言同理。
+- 短。多数回复一句话：中文 5～30 字，英文 5～25 个单词。X 上没人写长段落。
+- 平实，就事论事，回到对方说的那件事，或者你那条推文里的具体内容上。
+- 答不上来就说不知道，不用硬凑。
+
+明确不要：
+- 不要在回复里 @ 任何人，也不要带话题标签（#）和链接。回复会自动挂在对方推文下面。
+- 不要用「哈哈」「Haha」「LOL」开头。
+- 不要每条都加 emoji。十条里最多一两条带，且只带一个。
+- 不要说「感谢你的回复」「Thanks for reaching out」「Great question」这类客套空话。
+- 不要先复述对方的话再回应。
+- 不要用「～」这个波浪号。
+- 不要叫对方的名字或用户名。
+- 不要声称自己是真人，也不要否认这是自动回复。
+- 你只能看到文字。对方发的图片、视频、链接里的内容你看不到，不要假装看过并评价。
+
+分情况处理：
+- 提问 → 直接给答案，不寒暄。
+- 认真讨论，哪怕语气冲或观点跟你不同 → 就事论事回一句，不辩论不站队。
+- 夸奖 → 一句话接住，不过度谦虚也不重复道谢。
+- 想合作、想参加、想进一步联系 → 请对方私信（DM）你。只在对方确实有意向时才说。
+- 问你是不是机器人、是不是 AI、要求真人回复 → 只输出 [SKIP]，交给真人处理。
+- 人身攻击、辱骂、脏话 → 只输出 [SKIP]。
+- 用贬称或侮辱性标签指代你、某个国家、某个群体的，哪怕包装成反问句 → 只输出 [SKIP]。
+- 大段立场宣示、明显来引战的、政治话题 → 只输出 [SKIP]。
+- 推广、带货、求互关、拉你参加抽奖或空投之类的 → 只输出 [SKIP]。
+- 只有图片、视频、链接，或只是一串 @、纯表情、短到看不出意思的 → 只输出 [SKIP]。
+
+不知道的事情不要编。你手上只有那条推文和对方这一条，别的一概不知道：
+- 不要承诺推文里没提过的事，比如私发资料、开直播、送东西。
+- 不要编具体的地点、价格、时间、数据。
+- 不要替本人编个人情况和日程。
+- 不确定就说不清楚，或者请对方私信，都比编一个好。
+
+内容红线：
+- 不做任何收益、效果、疗效承诺
+- 不推荐具体股票、基金、加密货币、药品
+- 不涉及政治立场、医疗诊断、法律建议
+
+直接输出回复正文，不要加引号，不要加任何前后缀或解释。"""
+
+
+class XConfig(BaseModel):
+    # 开发者后台 → 你的 App → Keys and tokens。App 权限必须是 Read and Write，
+    # 而且要在改完权限之后再生成 Access Token，否则令牌仍是只读的。
+    api_key: str = ""                   # API Key（Consumer Key）
+    api_secret: str = ""                # API Key Secret
+    access_token: str = ""
+    access_token_secret: str = ""
+
+    # ---------- 回复 ----------
+    mode: str = "review"                # review 待审 | auto 全自动
+    # X 开发者指南：AI 生成并发布回复，需要事先获得 X 批准。没勾选就不允许全自动
+    ai_reply_approved: bool = False
+    poll_interval: int = Field(300, ge=60)          # 拉取 @ 的间隔（秒）
+    daily_limit: int = Field(50, ge=1)              # 每日回复上限
+    per_user_daily_limit: int = Field(3, ge=1)      # 每人每日最多回几条，防止来回刷屏
+    max_per_poll: int = Field(20, ge=5, le=100)     # 单次请求拉多少条 @
+    max_mentions_in_tweet: int = Field(5, ge=1)     # 一条推文 @ 的人超过这个数就当群发，不回
+    min_delay: float = Field(15.0, ge=1)
+    max_delay: float = Field(60.0, ge=1)
+    quiet_enabled: bool = True
+    quiet_start: str = "23:00"
+    quiet_end: str = "08:00"
+
+    # ---------- 关注者（只发现，不自动回关）----------
+    followers_enabled: bool = True
+    followers_poll_interval: int = Field(7200, ge=900)   # 检查新关注者的间隔（秒）
+    followers_page_size: int = Field(5, ge=1, le=100)    # 每次取几个，按返回人数计费
+    follow_daily_limit: int = Field(50, ge=1, le=400)    # 每日执行回关的上限
+    follow_min_delay: float = Field(20.0, ge=1)
+    follow_max_delay: float = Field(90.0, ge=1)
+
+    system_prompt: str = DEFAULT_X_PERSONA
+
+    @model_validator(mode="after")
+    def _check(self) -> "XConfig":
+        if self.mode not in ("review", "auto"):
+            raise ValueError("运行模式只能是 review 或 auto")
+        if self.mode == "auto" and not self.ai_reply_approved:
+            raise ValueError(
+                "X 要求 AI 生成的回复事先获得批准。拿到批准并勾选「已获得 X 批准」后才能切到全自动"
+            )
+        if self.max_delay < self.min_delay:
+            raise ValueError("回复间隔上限不能小于下限")
+        if self.follow_max_delay < self.follow_min_delay:
+            raise ValueError("回关间隔上限不能小于下限")
+        return self
+
+    @property
+    def has_credentials(self) -> bool:
+        return all((self.api_key, self.api_secret, self.access_token, self.access_token_secret))
+
+
 class AppConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     reply: ReplyConfig = Field(default_factory=ReplyConfig)
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
     persona: PersonaConfig = Field(default_factory=PersonaConfig)
+    x: XConfig = Field(default_factory=XConfig)
 
 
 _SECTIONS = {
@@ -142,6 +243,13 @@ _SECTIONS = {
     "reply": ReplyConfig,
     "safety": SafetyConfig,
     "persona": PersonaConfig,
+    "x": XConfig,
+}
+
+# 各分组里的密钥字段。导出给前端时脱敏，前端原样回传掩码时保持原值不变。
+SECRET_FIELDS = {
+    "llm": ("api_key",),
+    "x": ("api_key", "api_secret", "access_token", "access_token_secret"),
 }
 
 
@@ -153,8 +261,13 @@ def load() -> AppConfig:
         try:
             data[name] = model_cls(**stored)
         except Exception:
-            # 存储的配置结构与当前版本不兼容时退回默认值，避免守护进程起不来
-            data[name] = model_cls()
+            # 存储的配置结构与当前版本不兼容时退回默认值，避免守护进程起不来。
+            # X 分组里有密钥，整组退回默认等于把密钥清空，所以先试着只把模式
+            # 降回审核再加载一次。
+            try:
+                data[name] = model_cls(**{**stored, "mode": "review"})
+            except Exception:
+                data[name] = model_cls()
     cfg = AppConfig(**data)
 
     # 环境变量兜底：首次启动时可用 XHS_API_KEY 预置，省去手动填写
@@ -176,10 +289,21 @@ def save_section(name: str, values: dict[str, Any]) -> BaseModel:
     return validated
 
 
+def is_masked(value: Any) -> bool:
+    """前端回传的是不是脱敏后的掩码（说明用户没改这一项）"""
+    return isinstance(value, str) and ("·" in value or value == "已设置")
+
+
+def _mask(key: str) -> str:
+    return f"{key[:6]}······{key[-4:]}" if len(key) > 12 else ("已设置" if key else "")
+
+
 def redact(cfg: AppConfig) -> dict[str, Any]:
-    """导出给前端的配置，API Key 脱敏"""
+    """导出给前端的配置，所有密钥脱敏"""
     data = cfg.model_dump()
-    key = data["llm"]["api_key"]
-    data["llm"]["api_key"] = f"{key[:6]}······{key[-4:]}" if len(key) > 12 else ("已设置" if key else "")
-    data["llm"]["has_key"] = bool(key)
+    data["llm"]["has_key"] = bool(data["llm"]["api_key"])
+    data["x"]["has_credentials"] = cfg.x.has_credentials
+    for section, fields in SECRET_FIELDS.items():
+        for f in fields:
+            data[section][f] = _mask(data[section][f])
     return data

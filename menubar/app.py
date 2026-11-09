@@ -3,7 +3,8 @@
 菜单栏 App。
 
 它只是守护进程的遥控器：进程本身由 launchd 托管（开机自启、崩溃自愈），
-这里通过 HTTP 控制「监控引擎」的启停并显示状态。
+这里通过 HTTP 控制「监控引擎」的启停并显示状态。小红书和 X 是两个独立的
+引擎，各有一组状态和启停菜单项。
 
 这样即使关掉菜单栏 App，自动回复也照常运行；反过来菜单栏 App 崩了
 也不会带走守护进程。
@@ -91,18 +92,27 @@ class MenuBarApp(rumps.App):
 
         self.item_state = rumps.MenuItem("守护进程未运行")
         self.item_state.set_callback(None)          # 纯展示
+        self.item_toggle = rumps.MenuItem("开始小红书监控", callback=self.toggle_engine)
 
-        self.item_toggle = rumps.MenuItem("开始监控", callback=self.toggle_engine)
+        self.item_x_state = rumps.MenuItem("X：—")
+        self.item_x_state.set_callback(None)
+        self.item_x_toggle = rumps.MenuItem("开始 X 监控", callback=self.toggle_x_engine)
+
         self.item_console = rumps.MenuItem("打开控制台", callback=self.open_console)
         self.item_review = rumps.MenuItem("待审核 0 条", callback=self.open_review)
+        self.item_followers = rumps.MenuItem("X 新关注者 0 人", callback=self.open_review)
         self.item_login = rumps.MenuItem("扫码登录小红书", callback=self.do_login)
 
         self.menu = [
             self.item_state,
-            None,
             self.item_toggle,
+            None,
+            self.item_x_state,
+            self.item_x_toggle,
+            None,
             self.item_console,
             self.item_review,
+            self.item_followers,
             None,
             self.item_login,
             None,
@@ -124,35 +134,67 @@ class MenuBarApp(rumps.App):
             self.title = "书 ✕"
             self.item_state.title = "守护进程未运行"
             self.item_toggle.title = "启动守护进程"
+            self.item_x_state.title = "X：—"
+            self.item_x_toggle.hidden = True
             self.item_review.title = "待审核 —"
+            self.item_followers.hidden = True
             self.item_login.hidden = True
             return
 
+        x = s.get("x") or {}
         running = s.get("running")
-        pending = s.get("pending_review", 0)
-        today = s.get("today_sent", 0)
-        limit = s.get("daily_limit", 0)
+        x_running = x.get("running")
+        # 旧版守护进程没有 pending_review_total，退回小红书自己的待审数
+        pending = s.get("pending_review_total", s.get("pending_review", 0))
 
+        # ---- 小红书 ----
         if s.get("need_login"):
-            mark = "!"
             state_text = "需要扫码登录"
         elif s.get("state") == "error":
-            mark = "✕"
             state_text = "运行异常"
         elif s.get("state") == "quiet":
-            mark = "◐"
             state_text = "静默时段"
         elif running:
-            mark = "●"
             state_text = "监控中"
         else:
-            mark = "○"
             state_text = "已停止"
+        line = f"小红书：{state_text}"
+        if running:
+            line += f" · 今日 {s.get('today_sent', 0)}/{s.get('daily_limit', 0)}"
+        self.item_state.title = line
+        self.item_toggle.title = "停止小红书监控" if running else "开始小红书监控"
 
+        # ---- X ----
+        x_state = x.get("state", "stopped")
+        x_text = {
+            "running": "监控中", "quiet": "静默时段", "starting": "启动中",
+            "auth_error": "认证失败", "no_credit": "额度用完",
+            "rate_limited": "限流暂停", "error": "运行异常",
+        }.get(x_state, "已停止")
+        if not x.get("configured") and not x_running:
+            x_text = "未配置"
+        line = f"X：{x_text}"
+        if x_running:
+            line += f" · 今日 {x.get('today_sent', 0)}/{x.get('daily_limit', 0)}"
+        self.item_x_state.title = line
+        self.item_x_toggle.hidden = False
+        self.item_x_toggle.title = "停止 X 监控" if x_running else "开始 X 监控"
+
+        followers = x.get("followers_pending", 0)
+        self.item_followers.hidden = False
+        self.item_followers.title = f"X 新关注者 {followers} 人"
+
+        # ---- 图标：任一平台需要人处理就显示「!」 ----
+        if s.get("need_login") or x_state in ("auth_error", "no_credit"):
+            mark = "!"
+        elif s.get("state") == "error" or x_state == "error":
+            mark = "✕"
+        elif running or x_running:
+            mark = "●"
+        else:
+            mark = "○"
         self.title = f"书 {mark}" + (f" {pending}" if pending else "")
-        self.item_state.title = f"{state_text} · 今日 {today}/{limit}"
-        self.item_toggle.title = "停止监控" if running else "开始监控"
-        self.item_review.title = f"待审核 {pending} 条" if pending else "待审核 0 条"
+        self.item_review.title = f"待审核 {pending} 条"
         self.item_login.hidden = not s.get("need_login")
 
         if not s.get("llm_configured"):
@@ -168,6 +210,16 @@ class MenuBarApp(rumps.App):
         result = http("POST", f"/api/engine/{action}", timeout=20)
         if result:
             rumps.notification("小红书自动回复", "", result.get("message", ""))
+        self.refresh(None)
+
+    def toggle_x_engine(self, _):
+        if self.status is None:
+            self.restart_daemon(None)
+            return
+        action = "stop" if (self.status.get("x") or {}).get("running") else "start"
+        result = http("POST", f"/api/x/engine/{action}", timeout=20)
+        if result:
+            rumps.notification("自动回复", "X", result.get("message", ""))
         self.refresh(None)
 
     def open_console(self, _):

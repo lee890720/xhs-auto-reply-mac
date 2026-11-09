@@ -10,6 +10,7 @@ from loguru import logger
 
 from .llm import ChatClient, LLMError
 from .settings_store import AppConfig
+from .x_api import X_MAX_WEIGHT, truncate_weighted
 
 
 class SensitiveHit(Exception):
@@ -132,6 +133,70 @@ def clean_output(text: str, max_chars: int = 120) -> str:
     return text[:max_chars].strip()
 
 
+# 推文开头那串 @。回复别人时 X 会把对话里的人自动加在正文最前面，
+# 这些不是对方要说的话，喂给模型只会干扰它判断。
+_LEADING_MENTIONS = re.compile(r"^(?:\s*@\w{1,15})+\s*")
+
+
+def strip_leading_mentions(text: str) -> str:
+    return _LEADING_MENTIONS.sub("", text or "").strip()
+
+
+def build_x_prompt(
+    content: str,
+    context_text: str = "",
+    context_author: str = "",
+    context_is_mine: bool = False,
+    relation: str = "",
+    max_context_chars: int = 600,
+) -> str:
+    """
+    把一条 @ 我的推文组装成给模型的输入。
+
+    对应小红书的「笔记 + 评论」：对方回复或引用的那条推文就是上下文，
+    很多时候正是你自己发的那条。用户名不放进 prompt —— 模型知道了就容易
+    在回复里叫出来，而 X 会自动把回复挂到对方推文下面，根本不需要称呼。
+    """
+    lines = []
+    if context_text:
+        who = "你自己" if context_is_mine else (f"@{context_author}" if context_author else "另一位用户")
+        ctx = context_text[:max_context_chars]
+        if len(context_text) > max_context_chars:
+            ctx += "…"
+        if relation == "quoted":
+            lines.append(f"【对方引用的推文，作者是{who}】")
+        else:
+            lines.append(f"【对方回复的推文，作者是{who}】")
+        lines.append(ctx)
+        lines.append("")
+        lines.append("【对方的推文】")
+        lines.append(content)
+        lines.append("")
+        lines.append(
+            "请结合上面那条推文回复。对方多半是接着那条推文说的，"
+            "要回到具体这件事上，不要说放之四海皆可的泛泛之词。"
+        )
+    else:
+        lines.append("【一条 @ 了你的推文】")
+        lines.append(content)
+        lines.append("")
+        if relation:
+            lines.append(
+                "（它所回复的那条推文取不到，可能已被删除。）"
+                "请只针对这条推文本身简短回应，宁可含糊也不要猜测上下文。"
+            )
+    lines.append("回复会直接挂在对方这条推文下面，不需要 @ 任何人。")
+    lines.append("请直接给出你的回复正文，不要加引号，不要加任何解释。")
+    return "\n".join(lines)
+
+
+def clean_x_output(text: str) -> str:
+    """在通用清洗之外去掉开头的 @，并按 X 的加权长度截断"""
+    text = clean_output(text, max_chars=1000)
+    text = strip_leading_mentions(text)
+    return truncate_weighted(text, X_MAX_WEIGHT)
+
+
 class ReplyGenerator:
     def __init__(self, cfg: AppConfig):
         self.cfg = cfg
@@ -166,7 +231,46 @@ class ReplyGenerator:
             note_tags=note_tags,
             max_note_chars=self.cfg.reply.note_context_chars,
         )
+        return await self._complete_with_rules(
+            content, prompt, self.cfg.persona.system_prompt, clean_output
+        )
 
+    async def generate_x(
+        self,
+        content: str,
+        context_text: str = "",
+        context_author: str = "",
+        context_is_mine: bool = False,
+        relation: str = "",
+    ) -> str:
+        """
+        为一条 @ 我的推文生成回复。敏感词、弃答、禁用词规则与小红书共用，
+        人设用 X 自己的那份。
+
+        Raises:
+            SensitiveHit / SkipReply / LLMError，含义同 generate
+        """
+        hit = check_sensitive(content, self.cfg.safety.sensitive_keywords)
+        if hit:
+            if self.cfg.safety.on_sensitive == "fallback":
+                logger.warning(f"命中敏感词「{hit}」，使用兜底话术")
+                return truncate_weighted(self.cfg.safety.fallback_text, X_MAX_WEIGHT)
+            raise SensitiveHit(hit)
+
+        prompt = build_x_prompt(
+            content,
+            context_text=context_text,
+            context_author=context_author,
+            context_is_mine=context_is_mine,
+            relation=relation,
+            max_context_chars=self.cfg.reply.note_context_chars,
+        )
+        return await self._complete_with_rules(
+            content, prompt, self.cfg.x.system_prompt, clean_x_output
+        )
+
+    async def _complete_with_rules(self, content, prompt, system_prompt, clean) -> str:
+        """调模型，然后执行弃答判定和禁用词重试。两个平台共用这一段"""
         # 禁用词命中就重来一次。人设里的禁令是概率约束，温度 0.9 下压不住——
         # 尤其笔记正文自己写着「拉群约球」时，模型很容易把原话搬进回复。
         hit = ""
@@ -177,8 +281,8 @@ class ReplyGenerator:
                     f"\n\n注意：刚才那版回复里出现了「{hit}」，这是不允许的。"
                     f"重写一条，不要提到{hit}，需要进一步沟通就只说私信。"
                 )
-            raw = await self.client.complete(self.cfg.persona.system_prompt, user_prompt)
-            cleaned = clean_output(raw)
+            raw = await self.client.complete(system_prompt, user_prompt)
+            cleaned = clean(raw)
 
             if _SKIP_PATTERN.match(cleaned):
                 raise SkipReply(f"模型判断这条不宜回复: {content[:40]}")

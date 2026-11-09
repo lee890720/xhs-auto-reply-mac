@@ -3,9 +3,12 @@
 // 所有用户内容一律通过 textContent 写入，绝不拼接 HTML 字符串 —— 旧版控制台
 // 直接把评论内容拼进 HTML，昵称里带标签就能注入脚本。
 
-let state = { running: false, need_login: false };
+let state = { running: false, need_login: false, x: {} };
 let providers = [];
 let currentFilter = 'pending_review';
+let currentPlatform = '';                 // 空串表示两个平台都看
+let currentFollowerFilter = 'pending';
+let xMaxWeight = 280;
 
 const $ = (id) => document.getElementById(id);
 
@@ -17,6 +20,37 @@ const ENGINE_LABEL = {
   stopped: '已停止', starting: '启动中', running: '监控中',
   quiet: '静默时段', need_login: '需要登录', error: '异常',
 };
+const X_ENGINE_LABEL = {
+  stopped: '已停止', starting: '启动中', running: '监控中', quiet: '静默时段',
+  auth_error: '认证失败', no_credit: '额度用完', rate_limited: '限流暂停', error: '异常',
+};
+const PLATFORM_LABEL = { xhs: '小红书', x: 'X' };
+const FOLLOWER_LABEL = {
+  pending: '待处理', approved: '排队回关', followed: '已回关',
+  ignored: '已忽略', failed: '回关失败',
+};
+
+// X 的长度按加权字符算：拉丁字母、数字、常用标点算 1，中文和 emoji 算 2。
+// 与 xhsd/x_api.py 的 weighted_length 保持一致。
+const WEIGHT_1_RANGES = [[0, 4351], [8192, 8205], [8208, 8223], [8242, 8247]];
+function weightedLength(text) {
+  let n = 0;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0);
+    n += WEIGHT_1_RANGES.some(([lo, hi]) => cp >= lo && cp <= hi) ? 1 : 2;
+  }
+  return n;
+}
+
+function externalLink(href, text, cls) {
+  const a = document.createElement('a');
+  a.href = href;
+  a.target = '_blank';
+  a.rel = 'noopener noreferrer';
+  a.textContent = text;
+  if (cls) a.className = cls;
+  return a;
+}
 
 function toast(msg, kind) {
   const el = $('toast');
@@ -58,59 +92,91 @@ function switchTab(name) {
 
   if (name === 'overview') loadStats();
   if (name === 'review') loadQueue();
+  if (name === 'followers') loadFollowers();
   if (name === 'logs') loadLogs();
 }
 
 // ============ 引擎状态 ============
 
+function setChip(prefix, cls, text, running) {
+  $(prefix + '-dot').className = 'dot ' + cls;
+  $(prefix + '-text').textContent = text;
+  const btn = $(prefix + '-toggle');
+  btn.textContent = running ? '停止' : '启动';
+  btn.className = 'btn btn-sm ' + (running ? '' : 'btn-primary');
+}
+
 function renderStatus(s) {
   state = s;
+  const x = s.x || {};
 
-  const dot = $('status-dot');
-  const text = $('status-text');
+  // ---- 小红书 ----
   let cls = '', label = ENGINE_LABEL[s.state] || s.state;
-
   if (s.need_login) { cls = 'warn'; label = '需要扫码登录'; }
   else if (s.state === 'error') cls = 'err';
   else if (s.state === 'running') cls = 'on';
   else if (s.state === 'quiet' || s.state === 'starting') cls = 'warn';
-
-  dot.className = 'dot ' + cls;
   const parts = [label];
   if (s.running) {
     parts.push(`今日 ${s.today_sent}/${s.daily_limit}`);
     // 队列非空时明确显示，否则用户看不出后台还在按间隔逐条发
     if (s.approved_waiting) parts.push(`待发 ${s.approved_waiting}`);
   }
-  text.textContent = parts.join(' · ');
+  setChip('xhs', cls, parts.join(' · '), s.running);
 
-  const btn = $('btn-toggle');
-  btn.textContent = s.running ? '停止' : '启动';
-  btn.className = 'btn ' + (s.running ? '' : 'btn-primary');
+  // ---- X ----
+  let xcls = '', xlabel = X_ENGINE_LABEL[x.state] || x.state || '–';
+  if (x.state === 'running') xcls = 'on';
+  else if (['auth_error', 'no_credit', 'error'].includes(x.state)) xcls = 'err';
+  else if (['quiet', 'starting', 'rate_limited'].includes(x.state)) xcls = 'warn';
+  if (!x.configured && !x.running) xlabel = '未配置';
+  const xparts = [xlabel];
+  if (x.running) {
+    if (x.account) xparts.push('@' + x.account);
+    xparts.push(`今日 ${x.today_sent}/${x.daily_limit}`);
+    if (x.approved_waiting) xparts.push(`待发 ${x.approved_waiting}`);
+    if (x.follow_queue) xparts.push(`待回关 ${x.follow_queue}`);
+  }
+  setChip('x', xcls, xparts.join(' · '), x.running);
 
+  // ---- 横幅 ----
   $('login-banner').hidden = !s.need_login;
   $('setup-banner').hidden = s.llm_configured;
+  const xNeedsHuman = x.state === 'auth_error' || x.state === 'no_credit';
+  $('x-banner').hidden = !xNeedsHuman;
+  if (xNeedsHuman) {
+    $('x-banner-title').textContent =
+      x.state === 'auth_error' ? 'X 认证失败，引擎已停止' : 'X API 额度用完，已暂停';
+    $('x-banner-text').textContent = x.last_error || '';
+  }
 
   const badge = $('badge-pending');
-  badge.textContent = s.pending_review;
-  badge.hidden = s.pending_review === 0;
+  badge.textContent = s.pending_review_total;
+  badge.hidden = !s.pending_review_total;
+  const fbadge = $('badge-followers');
+  fbadge.textContent = x.followers_pending || 0;
+  fbadge.hidden = !x.followers_pending;
 
-  $('stat-today').textContent = s.today_sent;
-  $('stat-pending').textContent = s.pending_review;
+  // ---- 概览卡片：两个平台合计，提示里分开列 ----
+  $('stat-today').textContent = (s.today_sent || 0) + (x.today_sent || 0);
+  $('stat-pending').textContent = s.pending_review_total;
   $('stat-quota').textContent =
-    `上限 ${s.daily_limit} · 剩余 ${Math.max(0, s.daily_limit - s.today_sent)}`;
+    `小红书 ${s.today_sent}/${s.daily_limit} · X ${x.today_sent || 0}/${x.daily_limit || 0}`;
 }
 
-async function toggleEngine() {
-  const action = state.running ? 'stop' : 'start';
-  $('btn-toggle').disabled = true;
+async function toggleEngine(platform) {
+  const running = platform === 'x' ? (state.x || {}).running : state.running;
+  const action = running ? 'stop' : 'start';
+  const base = platform === 'x' ? '/api/x/engine/' : '/api/engine/';
+  const btn = $(platform + '-toggle');
+  btn.disabled = true;
   try {
-    const r = await post('/api/engine/' + action);
+    const r = await post(base + action);
     toast(r.message, r.success ? 'ok' : 'err');
   } catch (e) {
     toast('操作失败: ' + e.message, 'err');
   } finally {
-    $('btn-toggle').disabled = false;
+    btn.disabled = false;
     refreshStatus();
   }
 }
@@ -130,7 +196,10 @@ async function recheckLogin() {
 
 async function refreshStatus() {
   try { renderStatus(await api('/api/status')); }
-  catch (e) { $('status-text').textContent = '守护进程未响应'; }
+  catch (e) {
+    $('xhs-text').textContent = '守护进程未响应';
+    $('x-text').textContent = '守护进程未响应';
+  }
 }
 
 // ============ 概览 ============
@@ -142,7 +211,7 @@ async function loadStats() {
   $('stat-rate').textContent = s.success_rate + '%';
   $('stat-failed').textContent = s.total_failed ? `失败 ${s.total_failed} 条` : '暂无失败记录';
   $('stat-total').textContent = s.total_sent;
-  $('stat-messages').textContent = `共采集 ${s.total_messages} 条评论`;
+  $('stat-messages').textContent = `共采集 ${s.total_messages} 条评论和 @`;
 
   const chart = $('chart');
   chart.textContent = '';
@@ -202,6 +271,19 @@ async function loadStats() {
 
 // ============ 审核队列 ============
 
+function renderPlatformFilters(pending) {
+  const bar = $('platform-filters');
+  bar.textContent = '';
+  for (const key of ['', 'xhs', 'x']) {
+    const b = document.createElement('button');
+    b.className = 'filter' + (key === currentPlatform ? ' active' : '');
+    const n = key ? pending[key] : 0;
+    b.textContent = (key ? PLATFORM_LABEL[key] : '全部平台') + (n ? ` · 待审 ${n}` : '');
+    b.onclick = () => { currentPlatform = key; loadQueue(); };
+    bar.appendChild(b);
+  }
+}
+
 function renderFilters(counts) {
   const bar = $('filters');
   bar.textContent = '';
@@ -223,9 +305,18 @@ function buildItem(r) {
   const head = document.createElement('div');
   head.className = 'item-head';
 
+  const isX = r.platform === 'x';
+  const plat = document.createElement('span');
+  plat.className = 'plat plat-' + (isX ? 'x' : 'xhs');
+  plat.textContent = PLATFORM_LABEL[r.platform] || '小红书';
+
   const author = document.createElement('span');
   author.className = 'item-author';
-  author.textContent = r.author || '未知用户';
+  if (isX && (r.author || '').startsWith('@')) {
+    author.appendChild(externalLink('https://x.com/' + encodeURIComponent(r.author.slice(1)), r.author));
+  } else {
+    author.textContent = r.author || '未知用户';
+  }
 
   const tag = document.createElement('span');
   tag.className = 'tag tag-' + r.status.replace('pending_review', 'pending');
@@ -238,13 +329,17 @@ function buildItem(r) {
   meta.className = 'item-meta';
   const clock = (ts) => (ts || '').slice(11, 19);
   const bits = [];
-  if (r.raw_time) bits.push(`评论于 ${r.raw_time}`);
+  if (r.raw_time) bits.push(`${isX ? '发布于' : '评论于'} ${r.raw_time}`);
   if (r.status === 'sent' && r.sent_at) bits.push(`已发送 ${clock(r.sent_at)}`);
   else if (r.status === 'approved') bits.push('排队中，按发送间隔依次发出');
   else if (r.created_at) bits.push(`采集于 ${clock(r.created_at)}`);
   meta.textContent = bits.join(' · ');
 
-  head.append(author, tag, meta);
+  head.append(plat, author, tag, meta);
+  if (isX && r.external_id) {
+    head.appendChild(externalLink(
+      'https://x.com/i/web/status/' + encodeURIComponent(r.external_id), '查看原推 ↗', 'item-link'));
+  }
 
   // 正文
   const body = document.createElement('div');
@@ -269,13 +364,22 @@ function buildItem(r) {
 
   // 先显示笔记内容再显示评论 —— 审核时得先知道这条评论是在什么话题下说的，
   // 否则「约起来，我可以」这种评论根本判断不了回复对不对。
-  const noteText = [r.note_title, r.note_body].filter(Boolean).join(' — ');
+  // X 的上下文是对方回复（或引用）的那条推文：note_title 存作者，note_body 存正文
+  let noteText, noteLabel = '笔记';
+  if (isX) {
+    noteText = r.note_body || '';
+    const [relation, owner] = (r.note_type || '').split(':');
+    const who = owner === 'own' ? '你的推文' : `${r.note_title || '他人'} 的推文`;
+    noteLabel = relation === 'quoted' ? '引用了' + who : who;
+  } else {
+    noteText = [r.note_title, r.note_body].filter(Boolean).join(' — ');
+  }
   if (noteText) {
     const note = document.createElement('div');
     note.className = 'note-context';
     const label = document.createElement('span');
     label.className = 'note-label';
-    label.textContent = '笔记';
+    label.textContent = noteLabel;
     const text = document.createElement('span');
     text.textContent = noteText.length > 120 ? noteText.slice(0, 120) + '…' : noteText;
     note.append(label, text);
@@ -283,7 +387,9 @@ function buildItem(r) {
   } else if (r.note_id) {
     const note = document.createElement('div');
     note.className = 'note-context note-context-missing';
-    note.textContent = '这篇笔记没取到文字内容，回复是在没有上下文的情况下生成的';
+    note.textContent = isX
+      ? '它回复的那条推文没取到（可能已被删除），回复是在没有上下文的情况下生成的'
+      : '这篇笔记没取到文字内容，回复是在没有上下文的情况下生成的';
     main.appendChild(note);
   }
 
@@ -301,6 +407,20 @@ function buildItem(r) {
     ? '这条命中了敏感词，没有自动生成回复。你可以手写一条，或直接拒绝。'
     : '回复内容';
   main.appendChild(draft);
+
+  // X 有 280 加权字符的上限，审核时改长了要当场看得见，别等发送失败
+  if (isX) {
+    const counter = document.createElement('div');
+    counter.className = 'char-count';
+    const update = () => {
+      const n = weightedLength(draft.value);
+      counter.textContent = `${n}/${xMaxWeight}（中文一个字算 2）`;
+      counter.classList.toggle('over', n > xMaxWeight);
+    };
+    draft.addEventListener('input', update);
+    update();
+    main.appendChild(counter);
+  }
 
   if (r.error) {
     const err = document.createElement('div');
@@ -359,9 +479,11 @@ function buildItem(r) {
 async function loadQueue() {
   const box = $('queue');
   let data;
-  try { data = await api('/api/replies?status=' + currentFilter + '&limit=100'); }
+  const platformQuery = currentPlatform ? '&platform=' + currentPlatform : '';
+  try { data = await api('/api/replies?status=' + currentFilter + '&limit=100' + platformQuery); }
   catch (e) { toast('加载失败: ' + e.message, 'err'); return; }
 
+  renderPlatformFilters(data.platform_pending || {});
   renderFilters(data.counts);
   $('btn-approve-all').hidden = currentFilter !== 'pending_review' || !data.items.length;
 
@@ -378,11 +500,168 @@ async function loadQueue() {
 }
 
 async function approveAll() {
-  if (!confirm('确定批准所有待审回复？它们会按发送间隔依次发出。')) return;
+  const scope = currentPlatform ? PLATFORM_LABEL[currentPlatform] + '的' : '所有';
+  if (!confirm(`确定批准${scope}待审回复？它们会按发送间隔依次发出。`)) return;
   try {
-    const r = await post('/api/replies/approve_all');
+    const r = await post('/api/replies/approve_all' + (currentPlatform ? '?platform=' + currentPlatform : ''));
     toast(r.message, 'ok');
     loadQueue();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+// ============ X 新关注者 ============
+// 每个回关都必须是人对一个具体账号点的按钮，这里刻意没有批量操作。
+
+function renderFollowerFilters(counts) {
+  const bar = $('follower-filters');
+  bar.textContent = '';
+  for (const key of ['pending', 'approved', 'followed', 'ignored', 'failed']) {
+    const b = document.createElement('button');
+    b.className = 'filter' + (key === currentFollowerFilter ? ' active' : '');
+    b.textContent = FOLLOWER_LABEL[key] + (counts[key] ? ` ${counts[key]}` : '');
+    b.onclick = () => { currentFollowerFilter = key; loadFollowers(); };
+    bar.appendChild(b);
+  }
+}
+
+function buildFollower(f) {
+  const item = document.createElement('div');
+  item.className = 'item';
+  const row = document.createElement('div');
+  row.className = 'follower';
+
+  const img = document.createElement('img');
+  img.className = 'avatar';
+  img.referrerPolicy = 'no-referrer';
+  img.alt = '';
+  img.loading = 'lazy';
+  if (f.profile_image_url) img.src = f.profile_image_url;
+  img.onerror = () => { img.removeAttribute('src'); };
+  row.appendChild(img);
+
+  const main = document.createElement('div');
+  main.className = 'item-main';
+
+  const head = document.createElement('div');
+  head.className = 'item-head';
+  head.style.marginBottom = '0';
+  const name = document.createElement('span');
+  name.className = 'follower-name';
+  name.appendChild(externalLink('https://x.com/' + encodeURIComponent(f.username), f.name || f.username));
+  const handle = document.createElement('span');
+  handle.className = 'follower-handle';
+  handle.textContent = '@' + f.username;
+  const tag = document.createElement('span');
+  const tagClass = { pending: 'pending', approved: 'approved', followed: 'sent', ignored: 'ignored', failed: 'failed' };
+  tag.className = 'tag tag-' + (tagClass[f.status] || 'rejected');
+  tag.textContent = FOLLOWER_LABEL[f.status] || f.status;
+  const meta = document.createElement('span');
+  meta.className = 'item-meta';
+  meta.textContent = '发现于 ' + (f.first_seen_at || '').replace('T', ' ').slice(0, 16)
+    + (f.status === 'approved' ? ' · 排队中，按间隔依次执行' : '');
+  head.append(name, handle, tag);
+  if (f.protected) {
+    const lock = document.createElement('span');
+    lock.className = 'tag tag-rejected';
+    lock.textContent = '受保护账号';
+    head.appendChild(lock);
+  }
+  head.appendChild(meta);
+  main.appendChild(head);
+
+  const stats = document.createElement('div');
+  stats.className = 'follower-stats';
+  const since = (f.account_created_at || '').slice(0, 7);
+  stats.textContent = `粉丝 ${f.followers_count} · 关注 ${f.following_count} · 发帖 ${f.tweet_count}`
+    + (since ? ` · 注册于 ${since}` : '');
+  main.appendChild(stats);
+
+  if (f.description) {
+    const bio = document.createElement('div');
+    bio.className = 'follower-bio';
+    bio.textContent = f.description;
+    main.appendChild(bio);
+  }
+
+  if (f.flags) {
+    const flags = document.createElement('div');
+    flags.className = 'flags';
+    for (const fl of f.flags.split(',').filter(Boolean)) {
+      const el = document.createElement('span');
+      el.className = 'flag';
+      el.textContent = fl;
+      flags.appendChild(el);
+    }
+    main.appendChild(flags);
+  }
+
+  if (f.error) {
+    const err = document.createElement('div');
+    err.className = f.status === 'followed' ? 'note-context' : 'item-error';
+    err.textContent = f.error;
+    main.appendChild(err);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'item-actions';
+  const addBtn = (label, cls, handler) => {
+    const b = document.createElement('button');
+    b.className = 'btn btn-sm ' + cls;
+    b.textContent = label;
+    b.onclick = async () => {
+      b.disabled = true;
+      try { await handler(); }
+      catch (e) { toast(e.message, 'err'); }
+      finally { b.disabled = false; }
+    };
+    actions.appendChild(b);
+  };
+  if (['pending', 'ignored', 'failed'].includes(f.status)) {
+    addBtn('回关', 'btn-ok', async () => {
+      const r = await post(`/api/x/followers/${encodeURIComponent(f.user_id)}/follow`);
+      toast(r.message, 'ok');
+      loadFollowers();
+    });
+  }
+  if (f.status === 'pending') {
+    addBtn('忽略', '', async () => {
+      await post(`/api/x/followers/${encodeURIComponent(f.user_id)}/ignore`);
+      toast('已忽略');
+      loadFollowers();
+    });
+  }
+  if (actions.children.length) main.appendChild(actions);
+
+  row.appendChild(main);
+  item.appendChild(row);
+  return item;
+}
+
+async function loadFollowers() {
+  const box = $('followers');
+  let data;
+  try { data = await api('/api/x/followers?status=' + currentFollowerFilter + '&limit=100'); }
+  catch (e) { toast('加载失败: ' + e.message, 'err'); return; }
+
+  renderFollowerFilters(data.counts || {});
+  box.textContent = '';
+  if (!data.items.length) {
+    const p = document.createElement('div');
+    p.className = 'empty';
+    p.textContent = currentFollowerFilter === 'pending'
+      ? ((state.x || {}).running ? '没有待处理的新关注者' : '没有待处理的新关注者（X 引擎没有运行）')
+      : '这个分类下暂无记录';
+    box.appendChild(p);
+    return;
+  }
+  for (const f of data.items) box.appendChild(buildFollower(f));
+}
+
+async function checkFollowers() {
+  try {
+    const r = await post('/api/x/followers/check');
+    toast(r.message, r.success ? 'ok' : 'err');
+    if (r.success) setTimeout(loadFollowers, 4000);
   } catch (e) { toast(e.message, 'err'); }
 }
 
@@ -425,6 +704,19 @@ function fillForm(cfg) {
   set('safety-on_sensitive', cfg.safety.on_sensitive);
   set('safety-fallback_text', cfg.safety.fallback_text);
   set('safety-forbidden_in_reply', (cfg.safety.forbidden_in_reply || []).join('\n'));
+
+  const x = cfg.x;
+  for (const k of ['api_key', 'api_secret', 'access_token', 'access_token_secret',
+                   'mode', 'poll_interval', 'daily_limit', 'per_user_daily_limit',
+                   'max_per_poll', 'max_mentions_in_tweet', 'min_delay', 'max_delay',
+                   'quiet_start', 'quiet_end', 'followers_poll_interval',
+                   'followers_page_size', 'follow_daily_limit', 'follow_min_delay',
+                   'follow_max_delay', 'system_prompt']) {
+    set('x-' + k, x[k]);
+  }
+  $('x-ai_reply_approved').checked = x.ai_reply_approved;
+  $('x-quiet_enabled').checked = x.quiet_enabled;
+  $('x-followers_enabled').checked = x.followers_enabled;
 }
 
 function onProviderChange() {
@@ -483,6 +775,37 @@ function collectSection(name) {
     quiet_start: $('reply-quiet_start').value.trim(),
     quiet_end: $('reply-quiet_end').value.trim(),
   };
+  const num = (id) => parseFloat($(id).value);
+  const int = (id) => parseInt($(id).value, 10);
+  if (name === 'x-account') return {
+    api_key: $('x-api_key').value.trim(),
+    api_secret: $('x-api_secret').value.trim(),
+    access_token: $('x-access_token').value.trim(),
+    access_token_secret: $('x-access_token_secret').value.trim(),
+  };
+  if (name === 'x-reply') return {
+    mode: $('x-mode').value,
+    ai_reply_approved: $('x-ai_reply_approved').checked,
+    poll_interval: int('x-poll_interval'),
+    daily_limit: int('x-daily_limit'),
+    per_user_daily_limit: int('x-per_user_daily_limit'),
+    max_per_poll: int('x-max_per_poll'),
+    max_mentions_in_tweet: int('x-max_mentions_in_tweet'),
+    min_delay: num('x-min_delay'),
+    max_delay: num('x-max_delay'),
+    quiet_enabled: $('x-quiet_enabled').checked,
+    quiet_start: $('x-quiet_start').value.trim(),
+    quiet_end: $('x-quiet_end').value.trim(),
+  };
+  if (name === 'x-followers') return {
+    followers_enabled: $('x-followers_enabled').checked,
+    followers_poll_interval: int('x-followers_poll_interval'),
+    followers_page_size: int('x-followers_page_size'),
+    follow_daily_limit: int('x-follow_daily_limit'),
+    follow_min_delay: num('x-follow_min_delay'),
+    follow_max_delay: num('x-follow_max_delay'),
+  };
+  if (name === 'x-persona') return { system_prompt: $('x-system_prompt').value };
   if (name === 'safety') return {
     sensitive_keywords: $('safety-sensitive_keywords').value
       .split('\n').map(s => s.trim()).filter(Boolean),
@@ -499,10 +822,12 @@ async function saveSection(name) {
   msg.textContent = '保存中…';
   msg.className = 'form-msg';
   try {
-    const r = await put('/api/config/' + name, { values: collectSection(name) });
+    // X 的几组设置在后端是同一个配置分组，分开保存只是为了页面好读
+    const section = name.startsWith('x-') ? 'x' : name;
+    const r = await put('/api/config/' + section, { values: collectSection(name) });
     msg.textContent = '已保存，立即生效';
     msg.className = 'form-msg ok';
-    if (name === 'llm') fillForm(r.config);
+    if (name === 'llm' || name === 'x-account') fillForm(r.config);
     refreshStatus();
   } catch (e) {
     msg.textContent = e.message;
@@ -524,9 +849,25 @@ async function testLLM() {
   }
 }
 
-async function saveAutostart() {
+async function testX() {
+  const msg = $('msg-x-account');
+  msg.textContent = '正在测试…';
+  msg.className = 'form-msg';
   try {
-    await put('/api/autostart', { values: { enabled: $('autostart').checked } });
+    const r = await post('/api/x/test');
+    msg.textContent = r.message;
+    msg.className = 'form-msg ' + (r.success ? 'ok' : 'err');
+  } catch (e) {
+    msg.textContent = e.message;
+    msg.className = 'form-msg err';
+  }
+}
+
+async function saveAutostart(platform) {
+  const isX = platform === 'x';
+  const box = $(isX ? 'x-autostart' : 'autostart');
+  try {
+    await put(isX ? '/api/x/autostart' : '/api/autostart', { values: { enabled: box.checked } });
     toast('已保存', 'ok');
   } catch (e) { toast(e.message, 'err'); }
 }
@@ -545,6 +886,8 @@ async function loadConfig() {
     const data = await api('/api/config');
     providers = data.providers;
     $('autostart').checked = data.autostart;
+    $('x-autostart').checked = data.x_autostart;
+    xMaxWeight = data.x_max_weight || 280;
     fillForm(data.config);
   } catch (e) { toast('配置加载失败: ' + e.message, 'err'); }
 }
@@ -595,18 +938,20 @@ function connectStream() {
   es.onmessage = (ev) => {
     try {
       const s = JSON.parse(ev.data);
-      const wasPending = state.pending_review;
+      const wasPending = state.pending_review_total;
+      const wasFollowers = (state.x || {}).followers_pending;
       renderStatus(s);
       // 待审数变化时自动刷新队列，不用手动点
-      if (s.pending_review !== wasPending &&
-          document.querySelector('.panel.active').id === 'panel-review') {
-        loadQueue();
-      }
+      const active = document.querySelector('.panel.active').id;
+      if (s.pending_review_total !== wasPending && active === 'panel-review') loadQueue();
+      if ((s.x || {}).followers_pending !== wasFollowers && active === 'panel-followers') loadFollowers();
     } catch (e) { /* 忽略单条解析失败 */ }
   };
   es.onerror = () => {
-    $('status-dot').className = 'dot err';
-    $('status-text').textContent = '与守护进程断开';
+    for (const p of ['xhs', 'x']) {
+      $(p + '-dot').className = 'dot err';
+      $(p + '-text').textContent = '与守护进程断开';
+    }
     es.close();
     setTimeout(connectStream, 5000);
   };

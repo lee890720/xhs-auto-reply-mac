@@ -114,10 +114,10 @@ class Engine:
             "browser_open": self.browser.is_open,
             "mode": cfg.reply.mode,
             "quiet_now": in_quiet_hours(cfg.reply),
-            "today_sent": db.count_sent_today(),
+            "today_sent": db.count_sent_today(db.PLATFORM_XHS),
             "daily_limit": cfg.reply.daily_limit,
-            "pending_review": db.count_by_status(db.STATUS_PENDING_REVIEW),
-            "approved_waiting": db.count_by_status(db.STATUS_APPROVED),
+            "pending_review": db.count_by_status(db.STATUS_PENDING_REVIEW, db.PLATFORM_XHS),
+            "approved_waiting": db.count_by_status(db.STATUS_APPROVED, db.PLATFORM_XHS),
             "llm_configured": bool(cfg.llm.api_key),
         }
 
@@ -381,12 +381,12 @@ class Engine:
 
     async def _drain_send_queue(self, cfg: settings_store.AppConfig) -> None:
         while self.running:
-            sent_today = db.count_sent_today()
+            sent_today = db.count_sent_today(db.PLATFORM_XHS)
             if sent_today >= cfg.reply.daily_limit:
                 logger.warning(f"今日已发送 {sent_today} 条，达到上限 {cfg.reply.daily_limit}")
                 return
 
-            row = db.next_approved_reply()
+            row = db.next_approved_reply(db.PLATFORM_XHS)
             if not row:
                 return
 

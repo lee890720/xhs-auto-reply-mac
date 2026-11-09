@@ -74,7 +74,43 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);
+
+-- X 的关注者。只用来发现「新关注者」并让人逐个决定要不要回关。
+-- X 开发者指南明确禁止自动回关，所以这里没有任何自动关注的路径：
+-- 状态只有人点了「回关」才会变成 approved，引擎只执行 approved 的。
+CREATE TABLE IF NOT EXISTS x_followers (
+    user_id            TEXT PRIMARY KEY,
+    username           TEXT    NOT NULL DEFAULT '',
+    name               TEXT    NOT NULL DEFAULT '',
+    description        TEXT    NOT NULL DEFAULT '',
+    profile_image_url  TEXT    NOT NULL DEFAULT '',
+    followers_count    INTEGER NOT NULL DEFAULT 0,
+    following_count    INTEGER NOT NULL DEFAULT 0,
+    tweet_count        INTEGER NOT NULL DEFAULT 0,
+    account_created_at TEXT    NOT NULL DEFAULT '',
+    protected          INTEGER NOT NULL DEFAULT 0,
+    flags              TEXT    NOT NULL DEFAULT '',   -- 疑似机器人特征，逗号分隔
+    status             TEXT    NOT NULL,
+    error              TEXT    NOT NULL DEFAULT '',
+    attempts           INTEGER NOT NULL DEFAULT 0,
+    first_seen_at      TEXT    NOT NULL,
+    acted_at           TEXT    NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_x_followers_status ON x_followers(status);
 """
+
+# 平台
+PLATFORM_XHS = "xhs"
+PLATFORM_X = "x"
+
+# X 关注者状态
+FOLLOWER_BASELINE = "baseline"   # 首次启动时已经在的老关注者，不进待处理列表
+FOLLOWER_PENDING = "pending"     # 新关注者，等人决定
+FOLLOWER_APPROVED = "approved"   # 人点了「回关」，等引擎执行
+FOLLOWER_FOLLOWED = "followed"   # 已回关（或本来就关注着）
+FOLLOWER_IGNORED = "ignored"     # 人选择不回关
+FOLLOWER_FAILED = "failed"       # 回关失败
 
 # 回复状态机
 STATUS_PENDING_REVIEW = "pending_review"  # 待人工审核
@@ -115,6 +151,12 @@ _MESSAGE_COLUMNS = {
     # 访问笔记详情页的凭证。存在消息上而不只存在 notes 表里，
     # 这样即使笔记一直没抓成功，之后重试也还有 token 可用。
     "note_xsec_token": "TEXT NOT NULL DEFAULT ''",
+    # 多平台。已有的历史消息全部来自小红书，默认值正好把它们归过去。
+    "platform": "TEXT NOT NULL DEFAULT 'xhs'",
+    # X 的推文 ID（回复时要用）、它所回复的推文 ID、作者的用户 ID
+    "external_id": "TEXT NOT NULL DEFAULT ''",
+    "parent_id": "TEXT NOT NULL DEFAULT ''",
+    "author_id": "TEXT NOT NULL DEFAULT ''",
 }
 
 
@@ -164,6 +206,10 @@ def insert_message(
     note_id: str = "",
     comment_id: str = "",
     note_xsec_token: str = "",
+    platform: str = PLATFORM_XHS,
+    external_id: str = "",
+    parent_id: str = "",
+    author_id: str = "",
 ) -> int | None:
     """
     插入消息。若指纹已存在返回 None（表示此消息之前已处理过）。
@@ -175,11 +221,13 @@ def insert_message(
                 """INSERT INTO messages
                    (fingerprint, msg_type, author, content, note_title,
                     note_image_url, raw_time, note_id, comment_id,
-                    note_xsec_token, collected_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    note_xsec_token, platform, external_id, parent_id,
+                    author_id, collected_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (fingerprint, msg_type, author, content, note_title,
                  note_image_url, raw_time, note_id, comment_id,
-                 note_xsec_token, now()),
+                 note_xsec_token, platform, external_id, parent_id,
+                 author_id, now()),
             )
             return cur.lastrowid
         except sqlite3.IntegrityError:
@@ -293,23 +341,38 @@ SELECT r.id, r.message_id, r.draft, r.final_text, r.status, r.provider,
        r.model, r.error, r.attempts, r.created_at, r.reviewed_at, r.sent_at,
        m.author, m.content, m.msg_type, m.note_image_url, m.raw_time,
        m.note_id, m.comment_id, m.note_xsec_token,
+       m.platform, m.external_id, m.parent_id, m.author_id,
        COALESCE(n.title, m.note_title) AS note_title,
        COALESCE(n.body, '')            AS note_body,
-       COALESCE(n.tags, '')            AS note_tags
+       COALESCE(n.tags, '')            AS note_tags,
+       COALESCE(n.note_type, '')       AS note_type
 FROM replies r
 JOIN messages m ON m.id = r.message_id
 LEFT JOIN notes n ON n.note_id = m.note_id
 """
 
 
-def list_replies(status: str | None = None, limit: int = 50, offset: int = 0) -> list[dict]:
+def _platform_clause(platform: str | None, alias: str = "m") -> tuple[str, tuple]:
+    """platform 为空表示不区分平台"""
+    if not platform:
+        return "", ()
+    return f" AND {alias}.platform = ?", (platform,)
+
+
+def list_replies(
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    platform: str | None = None,
+) -> list[dict]:
+    where, params = "WHERE 1 = 1", ()
     if status:
-        return query(
-            REPLY_JOIN + " WHERE r.status = ? ORDER BY r.id DESC LIMIT ? OFFSET ?",
-            (status, limit, offset),
-        )
+        where += " AND r.status = ?"
+        params += (status,)
+    clause, extra = _platform_clause(platform)
     return query(
-        REPLY_JOIN + " ORDER BY r.id DESC LIMIT ? OFFSET ?", (limit, offset)
+        REPLY_JOIN + f" {where}{clause} ORDER BY r.id DESC LIMIT ? OFFSET ?",
+        params + extra + (limit, offset),
     )
 
 
@@ -317,25 +380,161 @@ def get_reply(reply_id: int) -> dict | None:
     return query_one(REPLY_JOIN + " WHERE r.id = ?", (reply_id,))
 
 
-def next_approved_reply() -> dict | None:
-    """取一条待发送的回复（FIFO）"""
+def next_approved_reply(platform: str) -> dict | None:
+    """
+    取一条待发送的回复（FIFO）。
+
+    必须按平台取：两个平台各有自己的发送循环，取错了就会拿小红书的浏览器
+    去发一条推文的回复，或者反过来。
+    """
     return query_one(
-        REPLY_JOIN + " WHERE r.status = ? ORDER BY r.id ASC LIMIT 1",
-        (STATUS_APPROVED,),
+        REPLY_JOIN + " WHERE r.status = ? AND m.platform = ? ORDER BY r.id ASC LIMIT 1",
+        (STATUS_APPROVED, platform),
     )
 
 
-def count_sent_today() -> int:
-    """今日已成功发送数，用于日限额判断"""
+def count_sent_today(platform: str | None = None) -> int:
+    """今日已成功发送数，用于日限额判断。限额按平台各算各的"""
     today = datetime.now().date().isoformat()
+    clause, extra = _platform_clause(platform)
     return scalar(
-        "SELECT COUNT(*) FROM replies WHERE status = ? AND sent_at LIKE ?",
-        (STATUS_SENT, f"{today}%"),
+        "SELECT COUNT(*) FROM replies r JOIN messages m ON m.id = r.message_id "
+        f"WHERE r.status = ? AND r.sent_at LIKE ?{clause}",
+        (STATUS_SENT, f"{today}%") + extra,
     ) or 0
 
 
-def count_by_status(status: str) -> int:
-    return scalar("SELECT COUNT(*) FROM replies WHERE status = ?", (status,)) or 0
+def count_by_status(status: str, platform: str | None = None) -> int:
+    clause, extra = _platform_clause(platform)
+    return scalar(
+        "SELECT COUNT(*) FROM replies r JOIN messages m ON m.id = r.message_id "
+        f"WHERE r.status = ?{clause}",
+        (status,) + extra,
+    ) or 0
+
+
+def count_replies_to_author_today(platform: str, author_id: str) -> int:
+    """
+    今天已经给这个人生成过几条「会发出去或可能发出去」的回复。
+
+    用于每人每日上限：防止和同一个人在评论区来回刷屏。按生成时间算而不是
+    发送时间 —— 审核模式下草稿可能隔天才批，按发送时间算就拦不住草稿堆积。
+    被拒绝、被拦截、发送失败的不算。
+    """
+    today = datetime.now().date().isoformat()
+    return scalar(
+        """SELECT COUNT(*) FROM replies r JOIN messages m ON m.id = r.message_id
+           WHERE m.platform = ? AND m.author_id = ? AND r.created_at LIKE ?
+             AND r.status NOT IN (?, ?, ?)""",
+        (platform, author_id, f"{today}%",
+         STATUS_REJECTED, STATUS_BLOCKED, STATUS_FAILED),
+    ) or 0
+
+
+# ==================== X 关注者 ====================
+
+def follower_exists(user_id: str) -> bool:
+    return scalar("SELECT 1 FROM x_followers WHERE user_id = ?", (user_id,)) is not None
+
+
+def count_followers() -> int:
+    return scalar("SELECT COUNT(*) FROM x_followers") or 0
+
+
+def insert_follower(
+    user_id: str,
+    status: str,
+    username: str = "",
+    name: str = "",
+    description: str = "",
+    profile_image_url: str = "",
+    followers_count: int = 0,
+    following_count: int = 0,
+    tweet_count: int = 0,
+    account_created_at: str = "",
+    protected: bool = False,
+    flags: str = "",
+) -> bool:
+    """插入一个关注者。已存在返回 False，不覆盖人已经做过的决定"""
+    with connect() as conn:
+        try:
+            conn.execute(
+                """INSERT INTO x_followers
+                   (user_id, username, name, description, profile_image_url,
+                    followers_count, following_count, tweet_count,
+                    account_created_at, protected, flags, status, first_seen_at,
+                    acted_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, username, name, description, profile_image_url,
+                 followers_count, following_count, tweet_count,
+                 account_created_at, int(protected), flags, status, now(),
+                 now() if status == FOLLOWER_FOLLOWED else ""),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def get_follower(user_id: str) -> dict | None:
+    return query_one("SELECT * FROM x_followers WHERE user_id = ?", (user_id,))
+
+
+def list_followers(status: str | None = None, limit: int = 100, offset: int = 0) -> list[dict]:
+    if status:
+        return query(
+            """SELECT * FROM x_followers WHERE status = ?
+               ORDER BY first_seen_at DESC, rowid DESC LIMIT ? OFFSET ?""",
+            (status, limit, offset),
+        )
+    return query(
+        """SELECT * FROM x_followers WHERE status != ?
+           ORDER BY first_seen_at DESC, rowid DESC LIMIT ? OFFSET ?""",
+        (FOLLOWER_BASELINE, limit, offset),
+    )
+
+
+def count_followers_by_status() -> dict[str, int]:
+    rows = query("SELECT status, COUNT(*) AS n FROM x_followers GROUP BY status")
+    return {r["status"]: r["n"] for r in rows}
+
+
+def update_follower_status(
+    user_id: str,
+    status: str,
+    error: str | None = None,
+    mark_acted: bool = False,
+) -> None:
+    fields = ["status = ?"]
+    params: list[Any] = [status]
+    if error is not None:
+        fields.append("error = ?")
+        params.append(error)
+    if mark_acted:
+        fields.append("acted_at = ?")
+        params.append(now())
+    params.append(user_id)
+    execute(f"UPDATE x_followers SET {', '.join(fields)} WHERE user_id = ?", tuple(params))
+
+
+def bump_follow_attempts(user_id: str) -> None:
+    execute("UPDATE x_followers SET attempts = attempts + 1 WHERE user_id = ?", (user_id,))
+
+
+def next_approved_follow() -> dict | None:
+    """按人点「回关」的先后顺序执行"""
+    return query_one(
+        "SELECT * FROM x_followers WHERE status = ? ORDER BY acted_at ASC, rowid ASC LIMIT 1",
+        (FOLLOWER_APPROVED,),
+    )
+
+
+def count_followed_today() -> int:
+    """今天由本系统执行成功的回关数，用于每日回关上限"""
+    today = datetime.now().date().isoformat()
+    return scalar(
+        "SELECT COUNT(*) FROM x_followers WHERE status = ? AND acted_at LIKE ? AND attempts > 0",
+        (FOLLOWER_FOLLOWED, f"{today}%"),
+    ) or 0
 
 
 # ==================== 配置 ====================

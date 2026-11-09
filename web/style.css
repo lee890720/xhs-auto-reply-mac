@@ -76,6 +76,10 @@ body {
 .dot.err   { background: var(--red);   box-shadow: 0 0 0 3px rgba(220,38,38,.18); }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.45} }
 
+/* 两个平台各一组：状态 + 启停按钮 */
+.engine { display: flex; align-items: center; gap: 6px; }
+.chip-name { font-weight: 600; color: var(--text); }
+
 /* ============ 横幅 ============ */
 .banner {
   display: flex; align-items: center; justify-content: space-between;
@@ -199,6 +203,7 @@ main { max-width: 1080px; margin: 0 auto; padding: 20px 24px 60px; }
 .tag-failed   { background: #fee2e2; color: #991b1b; }
 .tag-rejected { background: #f4f4f5; color: #52525b; }
 .tag-blocked  { background: #ffedd5; color: #9a3412; }
+.tag-ignored  { background: #f4f4f5; color: #52525b; }
 @media (prefers-color-scheme: dark) {
   .tag-pending  { background: #3a2c0a; color: #fcd34d; }
   .tag-approved { background: #17273f; color: #93c5fd; }
@@ -206,6 +211,7 @@ main { max-width: 1080px; margin: 0 auto; padding: 20px 24px 60px; }
   .tag-failed   { background: #3a1414; color: #fca5a5; }
   .tag-rejected { background: #27272a; color: #a1a1aa; }
   .tag-blocked  { background: #3a1f0a; color: #fdba74; }
+  .tag-ignored  { background: #27272a; color: #a1a1aa; }
 }
 
 .item-thumb {
@@ -263,7 +269,7 @@ input[type=text], input[type=password], input[type=number], select, textarea {
   font-family: inherit; font-size: 13px;
 }
 textarea { line-height: 1.65; resize: vertical; font-size: 12.5px; }
-#persona-system_prompt, #safety-sensitive_keywords {
+#persona-system_prompt, #x-system_prompt, #safety-sensitive_keywords {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
 }
 input:focus, select:focus, textarea:focus {
@@ -323,8 +329,57 @@ input:focus, select:focus, textarea:focus {
 .toast.err { background: var(--red); }
 .toast.ok  { background: var(--green); }
 
+/* ============ 平台标签 ============ */
+.plat {
+  padding: 0 6px; border-radius: 4px; font-size: 10.5px; font-weight: 650;
+  line-height: 17px; letter-spacing: .2px; flex: none;
+}
+.plat-xhs { background: var(--accent-soft); color: var(--accent); }
+.plat-x   { background: #18181b; color: #fff; }
+@media (prefers-color-scheme: dark) {
+  .plat-x { background: #f4f4f5; color: #18181b; }
+}
+.item-author a, .follower-name a { color: inherit; text-decoration: none; }
+.item-author a:hover, .follower-name a:hover { text-decoration: underline; }
+.item-link { font-size: 11.5px; color: var(--blue); text-decoration: none; }
+.item-link:hover { text-decoration: underline; }
+.char-count { font-size: 11.5px; color: var(--text-faint); margin-top: 4px; text-align: right; }
+.char-count.over { color: var(--red); font-weight: 600; }
+
+.notice {
+  font-size: 12.5px; color: var(--text-dim); line-height: 1.65;
+  background: var(--surface); border: 1px solid var(--border);
+  border-left: 3px solid var(--blue);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  padding: 10px 14px; margin-bottom: 14px;
+}
+
+/* ============ X 新关注者 ============ */
+.follower { display: flex; gap: 12px; align-items: flex-start; }
+.avatar {
+  width: 44px; height: 44px; border-radius: 50%; flex: none;
+  object-fit: cover; background: var(--bg); border: 1px solid var(--border);
+}
+.follower-name { font-weight: 600; font-size: 13.5px; }
+.follower-handle { color: var(--text-faint); font-size: 12.5px; }
+.follower-stats { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+.follower-bio {
+  font-size: 13px; color: var(--text-dim); margin-top: 6px;
+  white-space: pre-wrap; word-break: break-word;
+}
+.flags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.flag {
+  padding: 1px 7px; border-radius: 5px; font-size: 11px;
+  background: #ffedd5; color: #9a3412;
+}
+@media (prefers-color-scheme: dark) {
+  .flag { background: #3a1f0a; color: #fdba74; }
+}
+
 @media (max-width: 640px) {
   .topbar, .tabs, main, .banner { padding-left: 14px; padding-right: 14px; }
+  .topbar { flex-wrap: wrap; }
+  .topbar-right { flex-wrap: wrap; }
   .card-value { font-size: 25px; }
   .item-body { flex-direction: column; }
   .author-name { width: 88px; }
